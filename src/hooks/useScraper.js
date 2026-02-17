@@ -1,9 +1,23 @@
 import { useCallback, useRef, useState } from 'react';
+import * as XLSX from 'xlsx';
 import { PREFECTURES, REGIONS, SERVICE_TYPES } from '../data/masterData.js';
 
 const PAGE_SIZE = 50;
 const RAW_API_BASE = String(import.meta.env.VITE_API_BASE_URL || '').trim();
 const DEFAULT_REMOTE_API_BASE = 'https://scrp-5na6.onrender.com';
+const EXCEL_EXPORT_COLUMNS = [
+    { key: 'prefecture', header: 'prefecture', width: 10 },
+    { key: 'businessNumber', header: 'businessNumber', width: 14 },
+    { key: 'name', header: 'name', width: 30 },
+    { key: 'postalCode', header: 'postalCode', width: 12 },
+    { key: 'address', header: 'address', width: 40 },
+    { key: 'phone', header: 'phone', width: 16 },
+    { key: 'fax', header: 'fax', width: 16 },
+    { key: 'userCount', header: 'userCount', width: 12 },
+    { key: 'serviceType', header: 'serviceType', width: 20 },
+    { key: 'corporateName', header: 'corporateName', width: 30 },
+    { key: 'corporateType', header: 'corporateType', width: 14 },
+];
 const API_BASE = (() => {
     const normalized = RAW_API_BASE.replace(/\/+$/, '');
     if (normalized) return normalized;
@@ -95,6 +109,55 @@ function readFileNameFromDisposition(headerValue, fallbackName) {
 
     const normalMatch = headerValue.match(/filename="?([^"]+)"?/i);
     return normalMatch?.[1] || fallbackName;
+}
+
+function normalizeUserCountForExport(item) {
+    const candidates = [
+        item?.userCount,
+        item?.totalUserNum,
+        item?.TotalUserNum,
+        item?.user_count,
+    ];
+    const first = candidates.find(
+        (value) => value !== undefined && value !== null && String(value).trim() !== ''
+    );
+    if (first === undefined) return '';
+    const digits = String(first).replace(/[^\d]/g, '');
+    return digits || String(first).trim();
+}
+
+function toExportRecord(item) {
+    return {
+        prefecture: item?.prefecture || '',
+        businessNumber: item?.jigyoushoNumber || item?.businessNumber || '',
+        name: item?.name || '',
+        postalCode: item?.postalCode || '',
+        address: item?.address || '',
+        phone: item?.phone || '',
+        fax: item?.fax || '',
+        userCount: normalizeUserCountForExport(item),
+        serviceType: item?.serviceType || '',
+        corporateName: item?.corporateName || '',
+        corporateType: item?.corporateType || '',
+    };
+}
+
+function buildExcelBlob(records) {
+    const rows = records.map((item) => {
+        const normalized = toExportRecord(item);
+        return EXCEL_EXPORT_COLUMNS.map((col) => normalized[col.key] || '');
+    });
+    const headers = EXCEL_EXPORT_COLUMNS.map((col) => col.header);
+
+    const workbook = XLSX.utils.book_new();
+    const worksheet = XLSX.utils.aoa_to_sheet([headers, ...rows]);
+    worksheet['!cols'] = EXCEL_EXPORT_COLUMNS.map((col) => ({ wch: col.width }));
+    XLSX.utils.book_append_sheet(workbook, worksheet, 'sheet1');
+
+    const bytes = XLSX.write(workbook, { type: 'array', bookType: 'xlsx' });
+    return new Blob([bytes], {
+        type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+    });
 }
 
 async function parseJsonResponse(response, endpointForError) {
@@ -360,6 +423,55 @@ export function useScraper() {
                 return;
             }
 
+            if (format === 'excel') {
+                try {
+                    const limit = 5000;
+                    const allRows = [];
+                    let page = 1;
+                    let expectedTotal = 0;
+
+                    while (page <= 2000) {
+                        const endpoint = `/api/data?page=${page}&limit=${limit}`;
+                        const response = await fetch(buildApiUrl(endpoint));
+                        if (!response.ok) {
+                            throw new Error(`HTTP ${response.status}`);
+                        }
+
+                        const payload = await parseJsonResponse(
+                            response,
+                            buildApiUrl(endpoint)
+                        );
+                        const chunk = Array.isArray(payload?.data) ? payload.data : [];
+                        if (!chunk.length) break;
+
+                        allRows.push(...chunk);
+                        expectedTotal =
+                            Number.parseInt(String(payload?.total || '0'), 10) || 0;
+                        if (expectedTotal > 0 && allRows.length >= expectedTotal) {
+                            break;
+                        }
+                        page += 1;
+                    }
+
+                    const source = allRows.length ? allRows : results;
+                    if (!source.length) {
+                        throw new Error('No exportable rows');
+                    }
+
+                    const blob = buildExcelBlob(source);
+                    pushDownloadBlob(blob, 'kaigo_data.xlsx');
+                    return;
+                } catch (error) {
+                    appendLog({
+                        phase: 'error',
+                        message: `excel-local-export-failed: ${normalizeNetworkErrorMessage(
+                            error
+                        )}`,
+                        progress: -1,
+                    });
+                }
+            }
+
             const exportPath = format === 'csv' ? '/api/export/csv' : '/api/export/excel';
             const fallbackName = format === 'csv' ? 'kaigo_data.csv' : 'kaigo_data.xlsx';
 
@@ -379,7 +491,7 @@ export function useScraper() {
                 alert(`エクスポート失敗: ${normalizeNetworkErrorMessage(error)}`);
             }
         },
-        [totalResults]
+        [appendLog, results, totalResults]
     );
 
     const clearData = useCallback(async () => {

@@ -4,6 +4,21 @@ function getBusinessNumber(item) {
     return item.jigyoushoNumber || item.businessNumber || '';
 }
 
+function getUserCount(item) {
+    const candidates = [
+        item?.userCount,
+        item?.totalUserNum,
+        item?.TotalUserNum,
+        item?.user_count,
+    ];
+    const first = candidates.find(
+        (value) => value !== undefined && value !== null && String(value).trim() !== ''
+    );
+    if (first === undefined) return '';
+    const digits = String(first).replace(/[^\d]/g, '');
+    return digits || String(first).trim();
+}
+
 function toRow(item) {
     return [
         item.prefecture || '',
@@ -13,7 +28,7 @@ function toRow(item) {
         item.address || '',
         item.phone || '',
         item.fax || '',
-        item.userCount || '',
+        getUserCount(item),
         item.serviceType || '',
         item.corporateName || '',
         item.corporateType || '',
