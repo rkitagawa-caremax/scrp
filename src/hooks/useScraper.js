@@ -2,7 +2,21 @@ import { useCallback, useRef, useState } from 'react';
 import { PREFECTURES, REGIONS, SERVICE_TYPES } from '../data/masterData.js';
 
 const PAGE_SIZE = 50;
-const API_BASE = (import.meta.env.VITE_API_BASE_URL || '').replace(/\/+$/, '');
+const RAW_API_BASE = String(import.meta.env.VITE_API_BASE_URL || '').trim();
+const DEFAULT_REMOTE_API_BASE = 'https://scrp-5na6.onrender.com';
+const API_BASE = (() => {
+    const normalized = RAW_API_BASE.replace(/\/+$/, '');
+    if (normalized) return normalized;
+
+    if (typeof window !== 'undefined') {
+        const host = String(window.location.hostname || '').toLowerCase();
+        if (host !== 'localhost' && host !== '127.0.0.1') {
+            return DEFAULT_REMOTE_API_BASE;
+        }
+    }
+
+    return '';
+})();
 
 function buildApiUrl(path) {
     const normalizedPath = path?.startsWith('/') ? path : `/${path || ''}`;
@@ -186,7 +200,7 @@ export function useScraper() {
     const ensureApiReachable = useCallback(async () => {
         const controller = new AbortController();
         const timer = setTimeout(() => controller.abort(), 45000);
-        const healthCandidates = ['/api/health', '/health', '/api/prefectures', '/prefectures'];
+        const healthCandidates = ['/api/health', '/api/prefectures'];
         let lastError = '';
 
         try {
