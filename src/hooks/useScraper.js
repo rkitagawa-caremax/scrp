@@ -5,7 +5,27 @@ const PAGE_SIZE = 50;
 const API_BASE = (import.meta.env.VITE_API_BASE_URL || '').replace(/\/+$/, '');
 
 function buildApiUrl(path) {
-    return `${API_BASE}${path}`;
+    const normalizedPath = path?.startsWith('/') ? path : `/${path || ''}`;
+    if (!API_BASE) return normalizedPath;
+
+    try {
+        const baseUrl = new URL(API_BASE, window.location.origin);
+        const basePath = baseUrl.pathname.replace(/\/+$/, '');
+        const baseEndsWithApi = /\/api$/i.test(basePath);
+        const pathStartsWithApi = /^\/api(\/|$)/i.test(normalizedPath);
+
+        let finalPath = normalizedPath;
+        if (baseEndsWithApi && pathStartsWithApi) {
+            finalPath = normalizedPath.replace(/^\/api/i, '') || '/';
+        }
+
+        return `${baseUrl.origin}${basePath}${finalPath}`;
+    } catch {
+        if (API_BASE.endsWith('/api') && /^\/api(\/|$)/i.test(normalizedPath)) {
+            return `${API_BASE}${normalizedPath.replace(/^\/api/i, '') || '/'}`;
+        }
+        return `${API_BASE}${normalizedPath}`;
+    }
 }
 
 function isLocalHostname(hostname) {
@@ -166,7 +186,7 @@ export function useScraper() {
     const ensureApiReachable = useCallback(async () => {
         const controller = new AbortController();
         const timer = setTimeout(() => controller.abort(), 45000);
-        const healthCandidates = ['/api/health', '/health', '/api/prefectures'];
+        const healthCandidates = ['/api/health', '/health', '/api/prefectures', '/prefectures'];
         let lastError = '';
 
         try {
