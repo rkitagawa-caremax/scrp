@@ -1,40 +1,56 @@
 import XLSX from 'xlsx';
 
+function getBusinessNumber(item) {
+    return item.jigyoushoNumber || item.businessNumber || '';
+}
+
+function toRow(item) {
+    return [
+        item.prefecture || '',
+        getBusinessNumber(item),
+        item.name || '',
+        item.postalCode || '',
+        item.address || '',
+        item.phone || '',
+        item.fax || '',
+        item.userCount || '',
+        item.serviceType || '',
+        item.corporateName || '',
+        item.corporateType || '',
+    ];
+}
+
 /**
- * 取得データをCSV文字列に変換
+ * Convert records to CSV.
  */
 export function toCSV(data) {
     if (!data || data.length === 0) return '';
 
     const headers = [
-        '都道府県', '事業所番号', '事業所名', '郵便番号',
-        '住所', '電話番号', 'FAX番号', 'サービス種別',
-        '法人名', '法人種別'
+        '都道府県',
+        '事業所番号',
+        '事業所名',
+        '郵便番号',
+        '住所',
+        '電話番号',
+        'FAX番号',
+        '利用者人数',
+        'サービス種別',
+        '法人名',
+        '法人種別',
     ];
 
-    const rows = data.map((item) => {
-        return [
-            item.prefecture || '',
-            item.jigyoushoNumber || '',
-            item.name || '',
-            item.postalCode || '',
-            item.address || '',
-            item.phone || '',
-            item.fax || '',
-            item.serviceType || '',
-            item.corporateName || '',
-            item.corporateType || '',
-        ]
+    const rows = data.map((item) =>
+        toRow(item)
             .map((v) => `"${String(v).replace(/"/g, '""')}"`)
-            .join(',');
-    });
+            .join(',')
+    );
 
-    // BOM付きUTF-8
     return '\uFEFF' + headers.join(',') + '\n' + rows.join('\n');
 }
 
 /**
- * 取得データをExcelバッファに変換
+ * Convert records to Excel.
  */
 export function toExcel(data) {
     if (!data || data.length === 0) {
@@ -45,39 +61,36 @@ export function toExcel(data) {
     }
 
     const headers = [
-        '都道府県', '事業所番号', '事業所名', '郵便番号',
-        '住所', '電話番号', 'FAX番号', 'サービス種別',
-        '法人名', '法人種別'
+        '都道府県',
+        '事業所番号',
+        '事業所名',
+        '郵便番号',
+        '住所',
+        '電話番号',
+        'FAX番号',
+        '利用者人数',
+        'サービス種別',
+        '法人名',
+        '法人種別',
     ];
 
-    const rows = data.map((item) => [
-        item.prefecture || '',
-        item.jigyoushoNumber || '',
-        item.name || '',
-        item.postalCode || '',
-        item.address || '',
-        item.phone || '',
-        item.fax || '',
-        item.serviceType || '',
-        item.corporateName || '',
-        item.corporateType || '',
-    ]);
+    const rows = data.map((item) => toRow(item));
 
     const wb = XLSX.utils.book_new();
     const ws = XLSX.utils.aoa_to_sheet([headers, ...rows]);
 
-    // 列幅の自動調整
     ws['!cols'] = [
-        { wch: 10 }, // 都道府県
-        { wch: 14 }, // 事業所番号
-        { wch: 30 }, // 事業所名
-        { wch: 10 }, // 郵便番号
-        { wch: 40 }, // 住所
-        { wch: 16 }, // 電話番号
-        { wch: 16 }, // FAX番号
-        { wch: 20 }, // サービス種別
-        { wch: 30 }, // 法人名
-        { wch: 12 }, // 法人種別
+        { wch: 10 },
+        { wch: 14 },
+        { wch: 30 },
+        { wch: 10 },
+        { wch: 40 },
+        { wch: 16 },
+        { wch: 16 },
+        { wch: 12 },
+        { wch: 20 },
+        { wch: 30 },
+        { wch: 12 },
     ];
 
     XLSX.utils.book_append_sheet(wb, ws, '事業所一覧');

@@ -8,11 +8,35 @@ function buildApiUrl(path) {
     return `${API_BASE}${path}`;
 }
 
+function isLocalHostname(hostname) {
+    return hostname === 'localhost' || hostname === '127.0.0.1';
+}
+
+function isLocalApiTarget() {
+    if (API_BASE) {
+        try {
+            const url = new URL(API_BASE, window.location.origin);
+            return isLocalHostname(url.hostname);
+        } catch {
+            return /localhost|127\.0\.0\.1/.test(API_BASE);
+        }
+    }
+
+    if (typeof window === 'undefined') return false;
+    return isLocalHostname(window.location.hostname);
+}
+
 function normalizeNetworkErrorMessage(error) {
     const text = String(error?.message || '');
     if (/failed to fetch|networkerror|network request failed/i.test(text)) {
+        if (isLocalApiTarget()) {
+            return (
+                'APIに接続できません。`npm run server` が起動しているか確認してください。' +
+                ` 接続先: ${buildApiUrl('/api/health')}`
+            );
+        }
         return (
-            'APIへ接続できません。`npm run server` が起動しているか確認してください。' +
+            'APIに接続できません。デプロイ先のAPI URL設定とバックエンド稼働状態を確認してください。' +
             ` 接続先: ${buildApiUrl('/api/health')}`
         );
     }
@@ -37,6 +61,17 @@ function readFileNameFromDisposition(headerValue, fallbackName) {
 
     const normalMatch = headerValue.match(/filename="?([^"]+)"?/i);
     return normalMatch?.[1] || fallbackName;
+}
+
+async function parseJsonResponse(response, endpointForError) {
+    const contentType = String(response.headers.get('Content-Type') || '').toLowerCase();
+    if (!contentType.includes('application/json')) {
+        const head = (await response.text()).slice(0, 120).replace(/\s+/g, ' ');
+        throw new Error(
+            `APIレスポンス形式が不正です: ${endpointForError} (${contentType || 'unknown'}) ${head}`
+        );
+    }
+    return response.json();
 }
 
 export function useScraper() {
@@ -82,7 +117,7 @@ export function useScraper() {
                 setProgress(data);
                 appendLog(data);
             } catch {
-                // ignore invalid message
+                // ignore malformed SSE message
             }
         };
 
@@ -103,13 +138,14 @@ export function useScraper() {
             });
             if (search) params.set('search', search);
 
+            const endpoint = `/api/data?${params.toString()}`;
             try {
-                const response = await fetch(buildApiUrl(`/api/data?${params.toString()}`));
+                const response = await fetch(buildApiUrl(endpoint));
                 if (!response.ok) {
                     throw new Error(`データ取得失敗: HTTP ${response.status}`);
                 }
 
-                const payload = await response.json();
+                const payload = await parseJsonResponse(response, buildApiUrl(endpoint));
                 setResults(payload.data || []);
                 setTotalResults(payload.total || 0);
                 setCurrentPage(payload.page || page);
@@ -129,21 +165,52 @@ export function useScraper() {
 
     const ensureApiReachable = useCallback(async () => {
         const controller = new AbortController();
-        const timer = setTimeout(() => controller.abort(), 8000);
+        const timer = setTimeout(() => controller.abort(), 45000);
+        const healthCandidates = ['/api/health', '/health', '/api/prefectures'];
+        let lastError = '';
+
         try {
-            const response = await fetch(buildApiUrl('/api/health'), {
-                signal: controller.signal,
-            });
-            if (!response.ok) {
-                if (response.status === 404) {
-                    throw new Error(
-                        'APIサーバーが古いバージョンです。3001番のNodeプロセスを停止して、`npm run server` を再起動してください。'
-                    );
+            for (const path of healthCandidates) {
+                const url = buildApiUrl(path);
+                try {
+                    const response = await fetch(url, { signal: controller.signal });
+                    if (!response.ok) {
+                        lastError = `${url}: HTTP ${response.status}`;
+                        continue;
+                    }
+
+                    const contentType = String(response.headers.get('Content-Type') || '').toLowerCase();
+                    if (!contentType.includes('application/json')) {
+                        // Static hosting may return index.html for unknown paths.
+                        lastError = `${url}: non-json response`;
+                        continue;
+                    }
+
+                    const json = await response.json().catch(() => ({}));
+                    if (path.endsWith('/prefectures')) {
+                        if (Array.isArray(json.prefectures)) return;
+                        lastError = `${url}: invalid payload`;
+                        continue;
+                    }
+
+                    if (json && (json.ok === true || typeof json.timestamp === 'string')) {
+                        return;
+                    }
+                    // health route may not include {ok:true}; treat any valid json as alive.
+                    return;
+                } catch (error) {
+                    lastError = `${url}: ${normalizeNetworkErrorMessage(error)}`;
                 }
-                throw new Error(`ヘルスチェック失敗: HTTP ${response.status}`);
             }
-        } catch (error) {
-            throw new Error(normalizeNetworkErrorMessage(error));
+
+            if (isLocalApiTarget()) {
+                throw new Error(
+                    `APIに接続できません。ローカルAPIを起動してください。最終確認: ${lastError}`
+                );
+            }
+            throw new Error(
+                `デプロイ先APIに接続できません。APIデプロイまたは VITE_API_BASE_URL を確認してください。最終確認: ${lastError}`
+            );
         } finally {
             clearTimeout(timer);
         }
@@ -183,8 +250,21 @@ export function useScraper() {
                     }),
                 });
 
-                const payload = await response.json().catch(() => ({}));
+                let payload = {};
+                try {
+                    payload = await parseJsonResponse(response, buildApiUrl(endpoint));
+                } catch {
+                    payload = {};
+                }
+
                 if (!response.ok) {
+                    if (response.status === 404) {
+                        throw new Error(
+                            `APIエンドポイントが見つかりません: ${buildApiUrl(
+                                endpoint
+                            )}。バックエンドが旧版か、デプロイ先が誤っています。`
+                        );
+                    }
                     throw new Error(payload.error || `HTTP ${response.status}`);
                 }
 
@@ -253,9 +333,7 @@ export function useScraper() {
                 );
                 pushDownloadBlob(blob, fileName);
             } catch (error) {
-                alert(
-                    `エクスポートに失敗しました: ${normalizeNetworkErrorMessage(error)}`
-                );
+                alert(`エクスポート失敗: ${normalizeNetworkErrorMessage(error)}`);
             }
         },
         [totalResults]

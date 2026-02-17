@@ -75,6 +75,14 @@ const FIELD_CANDIDATES = {
         '法人区分',
         'corporateType',
     ],
+    userCount: [
+        '利用者人数',
+        '利用者数',
+        'TotalUserNum',
+        'totalUserNum',
+        'userCount',
+        'user_count',
+    ],
 };
 
 const KEY_NORMALIZE_PATTERN =
@@ -91,6 +99,7 @@ const MERGE_FIELDS = [
     'serviceType',
     'corporateName',
     'corporateType',
+    'userCount',
     'sourceSite',
 ];
 
@@ -179,6 +188,10 @@ function normalizeJigyoushoNumber(value) {
     return digits;
 }
 
+function normalizeUserCount(value) {
+    return normalizeText(value).replace(/\D/g, '');
+}
+
 function inferPrefecture(address) {
     const normalizedAddress = normalizeText(address);
     if (!normalizedAddress) return '';
@@ -243,6 +256,7 @@ export function mapToStandardFormat(records, serviceTypeName, options = {}) {
                     extractField(record, 'serviceType') || serviceTypeName || '',
                 corporateName: extractField(record, 'corporateName'),
                 corporateType: extractField(record, 'corporateType'),
+                userCount: normalizeUserCount(extractField(record, 'userCount')),
                 sourceSite,
             };
         })
@@ -252,7 +266,8 @@ export function mapToStandardFormat(records, serviceTypeName, options = {}) {
                 item.address ||
                 item.jigyoushoNumber ||
                 item.phone ||
-                item.fax
+                item.fax ||
+                item.userCount
         );
 }
 

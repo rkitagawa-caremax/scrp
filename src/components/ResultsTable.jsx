@@ -56,9 +56,6 @@ const styles = {
         textOverflow: 'ellipsis',
         whiteSpace: 'nowrap',
     },
-    trHover: {
-        background: 'var(--bg-card-hover)',
-    },
     pagination: {
         display: 'flex',
         alignItems: 'center',
@@ -93,7 +90,7 @@ const styles = {
         fontSize: '0.95rem',
     },
     emptyIcon: {
-        fontSize: '3rem',
+        fontSize: '2rem',
         marginBottom: '12px',
         display: 'block',
     },
@@ -116,10 +113,11 @@ export default function ResultsTable({
         { key: 'prefecture', label: '都道府県', width: '80px' },
         { key: 'jigyoushoNumber', label: '事業所番号', width: '110px' },
         { key: 'name', label: '事業所名', width: '200px' },
-        { key: 'postalCode', label: '〒', width: '80px' },
+        { key: 'postalCode', label: '郵便番号', width: '80px' },
         { key: 'address', label: '住所', width: '250px' },
         { key: 'phone', label: '電話番号', width: '120px' },
         { key: 'fax', label: 'FAX番号', width: '120px' },
+        { key: 'userCount', label: '利用者人数', width: '90px' },
         { key: 'serviceType', label: 'サービス種別', width: '150px' },
         { key: 'corporateName', label: '法人名', width: '180px' },
     ];
@@ -128,13 +126,11 @@ export default function ResultsTable({
         <div style={styles.container}>
             <div style={styles.header}>
                 <span style={styles.count}>
-                    {totalResults > 0
-                        ? `全 ${totalResults.toLocaleString()} 件`
-                        : 'データなし'}
+                    {totalResults > 0 ? `全 ${totalResults.toLocaleString()} 件` : 'データなし'}
                 </span>
                 <input
                     type="text"
-                    placeholder="🔍 事業所名・住所で検索..."
+                    placeholder="事業所名・住所で検索..."
                     value={searchQuery}
                     onChange={(e) => onSearchChange(e.target.value)}
                     style={styles.searchInput}
@@ -152,7 +148,7 @@ export default function ResultsTable({
             <div style={styles.tableWrap}>
                 {results.length === 0 ? (
                     <div style={styles.empty}>
-                        <span style={styles.emptyIcon}>📋</span>
+                        <span style={styles.emptyIcon}>--</span>
                         データを取得してください
                     </div>
                 ) : (
@@ -178,8 +174,12 @@ export default function ResultsTable({
                                     }}
                                 >
                                     {columns.map((col) => (
-                                        <td key={col.key} style={styles.td} title={item[col.key] || ''}>
-                                            {item[col.key] || '-'}
+                                        <td
+                                            key={col.key}
+                                            style={styles.td}
+                                            title={resolveCellValue(item, col.key)}
+                                        >
+                                            {resolveCellValue(item, col.key)}
                                         </td>
                                     ))}
                                 </tr>
@@ -199,7 +199,7 @@ export default function ResultsTable({
                         onClick={() => currentPage > 1 && onPageChange(currentPage - 1)}
                         disabled={currentPage <= 1}
                     >
-                        ◀ 前へ
+                        前へ
                     </button>
 
                     {generatePageNumbers(currentPage, totalPages).map((p, i) =>
@@ -231,12 +231,28 @@ export default function ResultsTable({
                         }
                         disabled={currentPage >= totalPages}
                     >
-                        次へ ▶
+                        次へ
                     </button>
                 </div>
             )}
         </div>
     );
+}
+
+function resolveCellValue(item, key) {
+    if (key === 'userCount') {
+        const raw =
+            item?.userCount ??
+            item?.totalUserNum ??
+            item?.TotalUserNum ??
+            item?.['利用者人数'] ??
+            item?.['利用者数'];
+        const text = String(raw ?? '').trim();
+        return text ? text : '-';
+    }
+
+    const text = String(item?.[key] ?? '').trim();
+    return text ? text : '-';
 }
 
 function generatePageNumbers(current, total) {

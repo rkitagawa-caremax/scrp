@@ -29,10 +29,19 @@ function buildEmptyStats(source, errorMessage = '') {
     };
 }
 
-function shouldRunWebFallback(existingCount, prefectureCodes, serviceTypeIds) {
+function shouldRunWebFallback(existingRecords, prefectureCodes, serviceTypeIds) {
+    const existingCount = existingRecords.length;
     const requestedMatrixSize = prefectureCodes.length * serviceTypeIds.length;
     const expectedMinimum = Math.max(250, requestedMatrixSize * 12);
-    return existingCount < expectedMinimum;
+    if (existingCount < expectedMinimum) return true;
+
+    const withUserCount = existingRecords.filter(
+        (record) => String(record?.userCount || '').trim() !== ''
+    ).length;
+    const userCountCoverage = existingCount > 0 ? withUserCount / existingCount : 0;
+
+    // Run web source when open data is large enough but lacks user-count fields.
+    return userCountCoverage < 0.2;
 }
 
 /**
@@ -95,7 +104,7 @@ export async function scrapeFromMultipleSources(
         }
     }
 
-    if (shouldRunWebFallback(merged.length, prefectureCodes, serviceTypeIds)) {
+    if (shouldRunWebFallback(merged, prefectureCodes, serviceTypeIds)) {
         const webSourceId = 'web-scraping-fallback';
         const webLabel = '[Web補完]';
 
