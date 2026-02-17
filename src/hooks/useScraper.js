@@ -199,7 +199,7 @@ export function useScraper() {
 
     const ensureApiReachable = useCallback(async () => {
         const controller = new AbortController();
-        const timer = setTimeout(() => controller.abort(), 45000);
+        const timer = setTimeout(() => controller.abort(), 120000);
         const healthCandidates = ['/api/health', '/api/prefectures'];
         let lastError = '';
 
@@ -272,7 +272,16 @@ export function useScraper() {
             const endpoint = endpointByMethod[method] || endpointByMethod.multi;
 
             try {
-                await ensureApiReachable();
+                try {
+                    await ensureApiReachable();
+                } catch (healthError) {
+                    if (isLocalApiTarget()) throw healthError;
+                    appendLog({
+                        phase: 'parse',
+                        message: `health-check warning: ${normalizeNetworkErrorMessage(healthError)}`,
+                        progress: 0,
+                    });
+                }
                 openProgressStream();
 
                 const response = await fetch(buildApiUrl(endpoint), {
