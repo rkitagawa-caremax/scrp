@@ -5,6 +5,10 @@ import { PREFECTURES, REGIONS, SERVICE_TYPES } from '../data/masterData.js';
 const PAGE_SIZE = 50;
 const RAW_API_BASE = String(import.meta.env.VITE_API_BASE_URL || '').trim();
 const DEFAULT_REMOTE_API_BASE = 'https://scrp-5na6.onrender.com';
+const JOB_POLL_INTERVAL_MS = 2000;
+const JOB_POLL_TIMEOUT_MS = 30 * 60 * 1000;
+const LEGACY_RECOVERY_POLL_INTERVAL_MS = 3000;
+const LEGACY_RECOVERY_TIMEOUT_MS = 12 * 60 * 1000;
 const EXCEL_EXPORT_COLUMNS = [
     { key: 'prefecture', header: 'prefecture', width: 10 },
     { key: 'businessNumber', header: 'businessNumber', width: 14 },
@@ -111,6 +115,17 @@ function readFileNameFromDisposition(headerValue, fallbackName) {
     return normalMatch?.[1] || fallbackName;
 }
 
+function wait(ms) {
+    return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function isLikelyNetworkDisconnect(error) {
+    const text = String(error?.message || '');
+    return /failed to fetch|networkerror|network request failed|load failed|fetch failed/i.test(
+        text
+    );
+}
+
 function normalizeUserCountForExport(item) {
     const candidates = [
         item?.userCount,
@@ -185,7 +200,7 @@ export function useScraper() {
     const [totalPages, setTotalPages] = useState(0);
     const [searchQuery, setSearchQuery] = useState('');
 
-    const progressEventSourceRef = useRef(null);
+    const activeJobIdRef = useRef('');
 
     const appendLog = useCallback((data) => {
         setLogs((prev) => {
@@ -197,43 +212,16 @@ export function useScraper() {
         });
     }, []);
 
-    const closeProgressStream = useCallback(() => {
-        if (!progressEventSourceRef.current) return;
-        progressEventSourceRef.current.close();
-        progressEventSourceRef.current = null;
-    }, []);
-
-    const openProgressStream = useCallback(() => {
-        closeProgressStream();
-        const eventSource = new EventSource(buildApiUrl('/api/progress'));
-        progressEventSourceRef.current = eventSource;
-
-        eventSource.onmessage = (event) => {
-            try {
-                const data = JSON.parse(event.data);
-                setProgress(data);
-                appendLog(data);
-            } catch {
-                // ignore malformed SSE message
-            }
-        };
-
-        eventSource.onerror = () => {
-            eventSource.close();
-            if (progressEventSourceRef.current === eventSource) {
-                progressEventSourceRef.current = null;
-            }
-        };
-    }, [appendLog, closeProgressStream]);
-
     const fetchData = useCallback(
-        async (page, overrideSearch) => {
+        async (page, overrideSearch, overrideJobId) => {
             const search = overrideSearch ?? searchQuery;
+            const jobId = overrideJobId ?? activeJobIdRef.current;
             const params = new URLSearchParams({
                 page: String(page),
                 limit: String(PAGE_SIZE),
             });
             if (search) params.set('search', search);
+            if (jobId) params.set('jobId', jobId);
 
             const endpoint = `/api/data?${params.toString()}`;
             try {
@@ -313,6 +301,180 @@ export function useScraper() {
         }
     }, []);
 
+    const pollJobUntilDone = useCallback(
+        async (jobId) => {
+            let afterLogSeq = 0;
+            const startedAt = Date.now();
+            let transientFailureCount = 0;
+
+            while (Date.now() - startedAt < JOB_POLL_TIMEOUT_MS) {
+                const endpoint = `/api/jobs/${encodeURIComponent(jobId)}?after=${afterLogSeq}`;
+                const statusUrl = buildApiUrl(endpoint);
+                let payload = null;
+                try {
+                    const response = await fetch(statusUrl);
+                    if (!response.ok) {
+                        throw new Error(`ジョブ状態の取得に失敗しました: HTTP ${response.status}`);
+                    }
+                    payload = await parseJsonResponse(response, statusUrl);
+                    transientFailureCount = 0;
+                } catch (pollError) {
+                    transientFailureCount += 1;
+                    if (transientFailureCount % 3 === 1) {
+                        appendLog({
+                            phase: 'parse',
+                            message: `ジョブ状態確認を再試行します: ${normalizeNetworkErrorMessage(
+                                pollError
+                            )}`,
+                            progress: 0,
+                        });
+                    }
+                    await wait(JOB_POLL_INTERVAL_MS);
+                    continue;
+                }
+
+                if (typeof payload.lastLogSeq === 'number') {
+                    afterLogSeq = payload.lastLogSeq;
+                }
+
+                const chunk = Array.isArray(payload.logs) ? payload.logs : [];
+                if (chunk.length) {
+                    chunk.forEach((entry) => {
+                        appendLog({
+                            phase: entry.phase || 'scrape',
+                            message: String(entry.message || ''),
+                            progress:
+                                typeof entry.progress === 'number'
+                                    ? entry.progress
+                                    : 0,
+                        });
+                    });
+
+                    const last = chunk[chunk.length - 1];
+                    setProgress({
+                        phase: last.phase || payload.progress?.phase || '',
+                        message: String(last.message || payload.progress?.message || ''),
+                        progress:
+                            typeof last.progress === 'number'
+                                ? last.progress
+                                : typeof payload.progress?.progress === 'number'
+                                  ? payload.progress.progress
+                                  : 0,
+                    });
+                } else if (payload.progress) {
+                    setProgress({
+                        phase: payload.progress.phase || '',
+                        message: payload.progress.message || '',
+                        progress:
+                            typeof payload.progress.progress === 'number'
+                                ? payload.progress.progress
+                                : 0,
+                    });
+                }
+
+                if (payload.status === 'completed') {
+                    activeJobIdRef.current = jobId;
+                    setSearchQuery('');
+                    await fetchData(1, '', jobId);
+                    return payload;
+                }
+
+                if (payload.status === 'failed') {
+                    throw new Error(payload.error || 'スクレイピングジョブが失敗しました。');
+                }
+
+                await wait(JOB_POLL_INTERVAL_MS);
+            }
+
+            throw new Error('ジョブ監視がタイムアウトしました。時間をおいて再実行してください。');
+        },
+        [appendLog, fetchData]
+    );
+
+    const readServerTotal = useCallback(async () => {
+        const endpoint = '/api/data?page=1&limit=1';
+        const url = buildApiUrl(endpoint);
+        const response = await fetch(url);
+        if (!response.ok) return -1;
+        const payload = await parseJsonResponse(response, url).catch(() => null);
+        return Number.parseInt(String(payload?.total || '0'), 10) || 0;
+    }, []);
+
+    const recoverLegacyScrapeAfterDisconnect = useCallback(
+        async (baselineTotal = -1) => {
+            let sawRunning = false;
+            let idlePolls = 0;
+            let lastError = '';
+            const startedAt = Date.now();
+
+            appendLog({
+                phase: 'parse',
+                message: '旧API実行中に接続が切断されました。結果復旧を試みます...',
+                progress: 0,
+            });
+
+            while (Date.now() - startedAt < LEGACY_RECOVERY_TIMEOUT_MS) {
+                try {
+                    const healthUrl = buildApiUrl('/api/health');
+                    const healthResponse = await fetch(healthUrl);
+                    if (!healthResponse.ok) {
+                        lastError = `health HTTP ${healthResponse.status}`;
+                        await wait(LEGACY_RECOVERY_POLL_INTERVAL_MS);
+                        continue;
+                    }
+
+                    const healthPayload = await parseJsonResponse(healthResponse, healthUrl).catch(
+                        () => null
+                    );
+                    const running = Boolean(healthPayload?.scraping?.running);
+
+                    if (running) {
+                        sawRunning = true;
+                        idlePolls = 0;
+                        setProgress({
+                            phase: 'scrape',
+                            message: '旧API処理継続中... 復旧を待機しています',
+                            progress: 0,
+                        });
+                        await wait(LEGACY_RECOVERY_POLL_INTERVAL_MS);
+                        continue;
+                    }
+
+                    const total = await readServerTotal();
+                    if (total >= 0 && total !== baselineTotal && total > 0) {
+                        setSearchQuery('');
+                        await fetchData(1, '', '');
+                        const complete = {
+                            phase: 'complete',
+                            message: `取得完了: ${total.toLocaleString()}件`,
+                            progress: 100,
+                        };
+                        setProgress(complete);
+                        appendLog(complete);
+                        return true;
+                    }
+
+                    idlePolls += 1;
+                    if ((sawRunning && idlePolls >= 6) || (!sawRunning && idlePolls >= 8)) {
+                        break;
+                    }
+                } catch (error) {
+                    lastError = normalizeNetworkErrorMessage(error);
+                }
+
+                await wait(LEGACY_RECOVERY_POLL_INTERVAL_MS);
+            }
+
+            appendLog({
+                phase: 'error',
+                message: `旧API復旧に失敗しました: ${lastError || '結果を確認できませんでした'}`,
+                progress: 0,
+            });
+            return false;
+        },
+        [appendLog, fetchData, readServerTotal]
+    );
+
     const startScraping = useCallback(
         async (prefCodes, serviceIds, method = 'multi') => {
             setIsLoading(true);
@@ -321,8 +483,9 @@ export function useScraper() {
             setCurrentPage(1);
             setTotalPages(0);
             setTotalResults(0);
+            activeJobIdRef.current = '';
             setProgress({
-                message: '取得処理を開始しています...',
+                message: '取得ジョブを開始しています...',
                 progress: 0,
                 phase: 'start',
             });
@@ -332,7 +495,7 @@ export function useScraper() {
                 opendata: '/api/scrape/opendata',
                 web: '/api/scrape/web',
             };
-            const endpoint = endpointByMethod[method] || endpointByMethod.multi;
+            const legacyEndpoint = endpointByMethod[method] || endpointByMethod.multi;
 
             try {
                 try {
@@ -345,12 +508,13 @@ export function useScraper() {
                         progress: 0,
                     });
                 }
-                openProgressStream();
 
+                const endpoint = '/api/jobs';
                 const response = await fetch(buildApiUrl(endpoint), {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify({
+                        method,
                         prefectureCodes: prefCodes,
                         serviceTypeIds: serviceIds,
                     }),
@@ -365,17 +529,105 @@ export function useScraper() {
 
                 if (!response.ok) {
                     if (response.status === 404) {
-                        throw new Error(
-                            `APIエンドポイントが見つかりません: ${buildApiUrl(
-                                endpoint
-                            )}。バックエンドが旧版か、デプロイ先が誤っています。`
-                        );
+                        appendLog({
+                            phase: 'parse',
+                            message: '新API未対応のため旧APIモードで実行します...',
+                            progress: 0,
+                        });
+
+                        const baselineTotal = await readServerTotal().catch(() => -1);
+                        let legacyResponse;
+                        try {
+                            legacyResponse = await fetch(buildApiUrl(legacyEndpoint), {
+                                method: 'POST',
+                                headers: { 'Content-Type': 'application/json' },
+                                body: JSON.stringify({
+                                    prefectureCodes: prefCodes,
+                                    serviceTypeIds: serviceIds,
+                                }),
+                            });
+                        } catch (legacyRequestError) {
+                            if (isLikelyNetworkDisconnect(legacyRequestError)) {
+                                const recovered =
+                                    await recoverLegacyScrapeAfterDisconnect(baselineTotal);
+                                if (recovered) return;
+                            }
+                            throw legacyRequestError;
+                        }
+
+                        let legacyPayload = {};
+                        try {
+                            legacyPayload = await parseJsonResponse(
+                                legacyResponse,
+                                buildApiUrl(legacyEndpoint)
+                            );
+                        } catch {
+                            legacyPayload = {};
+                        }
+
+                        if (!legacyResponse.ok) {
+                            if (
+                                legacyResponse.status >= 500 ||
+                                legacyResponse.status === 408 ||
+                                legacyResponse.status === 429
+                            ) {
+                                const recovered =
+                                    await recoverLegacyScrapeAfterDisconnect(baselineTotal);
+                                if (recovered) return;
+                            }
+                            throw new Error(legacyPayload.error || `HTTP ${legacyResponse.status}`);
+                        }
+
+                        if (Array.isArray(legacyPayload.sourceStats)) {
+                            legacyPayload.sourceStats.forEach((stat) => {
+                                appendLog({
+                                    phase: stat.status === 'ok' ? 'parse' : 'error',
+                                    message: `${stat.source}: ${stat.count}件`,
+                                    progress: -1,
+                                });
+                            });
+                        }
+
+                        setSearchQuery('');
+                        await fetchData(1, '', '');
+
+                        let legacyTotal =
+                            Number.parseInt(
+                                String(legacyPayload?.total || legacyPayload?.count || '0'),
+                                10
+                            ) || 0;
+                        if (legacyTotal <= 0) {
+                            legacyTotal = await readServerTotal().catch(() => 0);
+                        }
+                        const legacyComplete = {
+                            phase: 'complete',
+                            message: `取得完了: ${legacyTotal.toLocaleString()}件`,
+                            progress: 100,
+                        };
+                        setProgress(legacyComplete);
+                        appendLog(legacyComplete);
+                        return;
                     }
                     throw new Error(payload.error || `HTTP ${response.status}`);
                 }
 
-                if (Array.isArray(payload.sourceStats)) {
-                    payload.sourceStats.forEach((stat) => {
+                const jobId = String(payload?.jobId || '').trim();
+                if (!jobId) throw new Error('ジョブIDが返却されませんでした。');
+
+                const queued = {
+                    phase: 'start',
+                    message:
+                        Number.parseInt(String(payload?.queuePosition || '0'), 10) > 1
+                            ? `ジョブを受け付けました（待機 ${payload.queuePosition} 番目）`
+                            : 'ジョブを受け付けました。進捗を監視しています...',
+                    progress: 0,
+                };
+                setProgress(queued);
+                appendLog(queued);
+
+                const jobResult = await pollJobUntilDone(jobId);
+                if (Array.isArray(jobResult.sourceStats)) {
+                    jobResult.sourceStats.forEach((stat) => {
                         appendLog({
                             phase: stat.status === 'ok' ? 'parse' : 'error',
                             message: `${stat.source}: ${stat.count}件`,
@@ -384,12 +636,11 @@ export function useScraper() {
                     });
                 }
 
-                setSearchQuery('');
-                await fetchData(1, '');
+                const total = Number.parseInt(String(jobResult?.total || '0'), 10) || 0;
 
                 const complete = {
                     phase: 'complete',
-                    message: `取得完了: ${(payload.total || payload.count || 0).toLocaleString()}件`,
+                    message: `取得完了: ${total.toLocaleString()}件`,
                     progress: 100,
                 };
                 setProgress(complete);
@@ -403,16 +654,16 @@ export function useScraper() {
                 setProgress(failed);
                 appendLog(failed);
             } finally {
-                closeProgressStream();
                 setIsLoading(false);
             }
         },
         [
             appendLog,
-            closeProgressStream,
             ensureApiReachable,
             fetchData,
-            openProgressStream,
+            pollJobUntilDone,
+            readServerTotal,
+            recoverLegacyScrapeAfterDisconnect,
         ]
     );
 
@@ -423,6 +674,9 @@ export function useScraper() {
                 return;
             }
 
+            const activeJobId = activeJobIdRef.current;
+            const encodedJobId = activeJobId ? encodeURIComponent(activeJobId) : '';
+
             if (format === 'excel') {
                 try {
                     const limit = 5000;
@@ -431,7 +685,9 @@ export function useScraper() {
                     let expectedTotal = 0;
 
                     while (page <= 2000) {
-                        const endpoint = `/api/data?page=${page}&limit=${limit}`;
+                        const endpoint = encodedJobId
+                            ? `/api/data?page=${page}&limit=${limit}&jobId=${encodedJobId}`
+                            : `/api/data?page=${page}&limit=${limit}`;
                         const response = await fetch(buildApiUrl(endpoint));
                         if (!response.ok) {
                             throw new Error(`HTTP ${response.status}`);
@@ -472,7 +728,10 @@ export function useScraper() {
                 }
             }
 
-            const exportPath = format === 'csv' ? '/api/export/csv' : '/api/export/excel';
+            const exportPath = (() => {
+                const base = format === 'csv' ? '/api/export/csv' : '/api/export/excel';
+                return encodedJobId ? `${base}?jobId=${encodedJobId}` : base;
+            })();
             const fallbackName = format === 'csv' ? 'kaigo_data.csv' : 'kaigo_data.xlsx';
 
             try {
@@ -496,11 +755,16 @@ export function useScraper() {
 
     const clearData = useCallback(async () => {
         try {
-            await fetch(buildApiUrl('/api/data'), { method: 'DELETE' });
+            const activeJobId = activeJobIdRef.current;
+            const path = activeJobId
+                ? `/api/data?jobId=${encodeURIComponent(activeJobId)}`
+                : '/api/data';
+            await fetch(buildApiUrl(path), { method: 'DELETE' });
         } catch {
             // ignore clear API failure and continue local reset
         }
 
+        activeJobIdRef.current = '';
         setResults([]);
         setTotalResults(0);
         setCurrentPage(1);

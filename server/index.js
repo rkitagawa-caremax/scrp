@@ -10,12 +10,26 @@ const app = express();
 const PORT = Number.parseInt(process.env.PORT || '3001', 10);
 const HOST = process.env.HOST || '0.0.0.0';
 
+const MAX_STORED_JOBS = 30;
+const MAX_JOB_LOGS = 400;
+const JOB_METHODS = new Set(['multi', 'opendata', 'web']);
+const METHOD_LABELS = {
+    multi: '複数ソース取得',
+    opendata: '公式オープンデータ取得',
+    web: 'Webスクレイピング',
+};
+
 app.use(cors());
 app.use(express.json());
 
 let currentData = [];
-const sseClients = new Set();
+let currentDataJobId = '';
 let activeScrapeJob = null;
+
+const sseClients = new Set();
+const jobs = new Map();
+const jobQueue = [];
+let queueWorkerRunning = false;
 
 function normalizeUserCountValue(item) {
     const candidates = [
@@ -39,6 +53,10 @@ function normalizeRecordShape(item) {
     };
 }
 
+function nowIso(ts = Date.now()) {
+    return new Date(ts).toISOString();
+}
+
 function broadcastProgress(data) {
     const message = `data: ${JSON.stringify(data)}\n\n`;
     for (const client of sseClients) {
@@ -50,8 +68,274 @@ function broadcastProgress(data) {
     }
 }
 
-function validateScrapeRequest(req, res) {
+function getQueuePosition(jobId) {
+    const idx = jobQueue.indexOf(jobId);
+    return idx >= 0 ? idx + 1 : 0;
+}
+
+function trimFinishedJobs() {
+    if (jobs.size <= MAX_STORED_JOBS) return;
+
+    const candidates = [...jobs.values()]
+        .filter(
+            (job) =>
+                (job.status === 'completed' || job.status === 'failed') &&
+                job.id !== currentDataJobId
+        )
+        .sort((a, b) => {
+            const aTime = Number(a.finishedAt || a.createdAt || 0);
+            const bTime = Number(b.finishedAt || b.createdAt || 0);
+            return aTime - bTime;
+        });
+
+    for (const job of candidates) {
+        if (jobs.size <= MAX_STORED_JOBS) break;
+        jobs.delete(job.id);
+    }
+}
+
+function pushJobLog(job, data) {
+    if (!job) return;
+
+    const entry = {
+        seq: job.logSeq + 1,
+        time: nowIso(),
+        phase: data?.phase || 'scrape',
+        message: String(data?.message || ''),
+        progress:
+            typeof data?.progress === 'number'
+                ? data.progress
+                : typeof job.progress?.progress === 'number'
+                  ? job.progress.progress
+                  : -1,
+    };
+
+    job.logSeq = entry.seq;
+    job.logs.push(entry);
+    if (job.logs.length > MAX_JOB_LOGS) {
+        job.logs.splice(0, job.logs.length - MAX_JOB_LOGS);
+    }
+    job.progress = {
+        phase: entry.phase,
+        message: entry.message,
+        progress: entry.progress,
+    };
+
+    broadcastProgress({
+        jobId: job.id,
+        status: job.status,
+        ...job.progress,
+        time: entry.time,
+        seq: entry.seq,
+    });
+}
+
+function buildJobStatus(job, afterSeq = 0) {
+    const safeAfter = Number.isFinite(afterSeq) ? Math.max(0, afterSeq) : 0;
+    const logs =
+        safeAfter > 0 ? job.logs.filter((entry) => entry.seq > safeAfter) : [...job.logs];
+
+    return {
+        jobId: job.id,
+        method: job.method,
+        status: job.status,
+        queuePosition: job.status === 'queued' ? getQueuePosition(job.id) : 0,
+        createdAt: nowIso(job.createdAt),
+        startedAt: job.startedAt ? nowIso(job.startedAt) : null,
+        finishedAt: job.finishedAt ? nowIso(job.finishedAt) : null,
+        progress: job.progress,
+        total: job.total,
+        sourceStats: job.sourceStats,
+        error: job.error || '',
+        lastLogSeq: job.logSeq,
+        hasResult: job.status === 'completed',
+        logs,
+    };
+}
+
+function createScrapeJob({ method, prefectureCodes, serviceTypeIds }) {
+    const job = {
+        id: `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+        method,
+        prefectureCodes: [...prefectureCodes],
+        serviceTypeIds: [...serviceTypeIds],
+        status: 'queued',
+        createdAt: Date.now(),
+        startedAt: 0,
+        finishedAt: 0,
+        progress: {
+            phase: 'queued',
+            message: 'ジョブをキューに登録しました',
+            progress: 0,
+        },
+        logs: [],
+        logSeq: 0,
+        records: [],
+        total: 0,
+        sourceStats: [],
+        error: '',
+    };
+
+    jobs.set(job.id, job);
+    pushJobLog(job, {
+        phase: 'queued',
+        message: `${METHOD_LABELS[method] || method} ジョブを受け付けました`,
+        progress: 0,
+    });
+    return job;
+}
+
+async function runScrapeMethod(method, prefectureCodes, serviceTypeIds, onProgress) {
+    if (method === 'multi') {
+        const result = await scrapeFromMultipleSources(prefectureCodes, serviceTypeIds, onProgress);
+        return {
+            records: result.records || [],
+            sourceStats: Array.isArray(result.sourceStats) ? result.sourceStats : [],
+        };
+    }
+
+    if (method === 'opendata') {
+        const records = await fetchOpenData(prefectureCodes, serviceTypeIds, onProgress);
+        if (!records.length) {
+            throw new Error(
+                '公式オープンデータから取得できませんでした。条件を変更して再実行してください。'
+            );
+        }
+        return {
+            records,
+            sourceStats: [
+                {
+                    source: 'official-opendata',
+                    count: records.length,
+                    status: 'ok',
+                },
+            ],
+        };
+    }
+
+    if (method === 'web') {
+        const records = await scrapeWebData(prefectureCodes, serviceTypeIds, onProgress);
+        if (!records.length) {
+            throw new Error(
+                'Webスクレイピングで取得できませんでした。条件を変更して再実行してください。'
+            );
+        }
+        return {
+            records,
+            sourceStats: [
+                {
+                    source: 'web-scraping',
+                    count: records.length,
+                    status: 'ok',
+                },
+            ],
+        };
+    }
+
+    throw new Error(`未対応のジョブ種別です: ${method}`);
+}
+
+async function executeScrapeJob(job) {
+    job.status = 'running';
+    job.startedAt = Date.now();
+    job.error = '';
+    activeScrapeJob = {
+        id: job.id,
+        kind: job.method,
+        running: true,
+        startedAt: job.startedAt,
+    };
+
+    pushJobLog(job, {
+        phase: 'start',
+        message: `${METHOD_LABELS[job.method] || job.method} を開始します...`,
+        progress: 0,
+    });
+
+    try {
+        const { records, sourceStats } = await runScrapeMethod(
+            job.method,
+            job.prefectureCodes,
+            job.serviceTypeIds,
+            (progressData) => pushJobLog(job, progressData)
+        );
+
+        const normalized = records.map(normalizeRecordShape);
+        job.records = normalized;
+        job.total = normalized.length;
+        job.sourceStats = sourceStats;
+        job.status = 'completed';
+        job.finishedAt = Date.now();
+
+        currentData = normalized;
+        currentDataJobId = job.id;
+
+        pushJobLog(job, {
+            phase: 'complete',
+            message: `取得完了: ${job.total.toLocaleString()}件`,
+            progress: 100,
+        });
+    } catch (error) {
+        job.status = 'failed';
+        job.finishedAt = Date.now();
+        job.error = String(error?.message || 'スクレイピング処理に失敗しました。');
+        pushJobLog(job, {
+            phase: 'error',
+            message: `エラー: ${job.error}`,
+            progress: 0,
+        });
+    } finally {
+        if (activeScrapeJob && activeScrapeJob.id === job.id) {
+            activeScrapeJob = null;
+        }
+    }
+}
+
+async function processJobQueue() {
+    if (queueWorkerRunning) return;
+    queueWorkerRunning = true;
+
+    try {
+        while (jobQueue.length > 0) {
+            const jobId = jobQueue.shift();
+            const job = jobs.get(jobId);
+            if (!job || job.status !== 'queued') continue;
+            await executeScrapeJob(job);
+            trimFinishedJobs();
+        }
+    } finally {
+        queueWorkerRunning = false;
+    }
+}
+
+function enqueueJob(job) {
+    jobQueue.push(job.id);
+    processJobQueue().catch((error) => {
+        console.error('Job queue worker crashed:', error);
+    });
+}
+
+function acceptScrapeJob(res, payload) {
+    const job = createScrapeJob(payload);
+    enqueueJob(job);
+    return res.status(202).json({
+        accepted: true,
+        jobId: job.id,
+        status: job.status,
+        queuePosition: getQueuePosition(job.id),
+        pollUrl: `/api/jobs/${job.id}`,
+        resultUrl: `/api/jobs/${job.id}/result`,
+    });
+}
+
+function validateScrapeRequest(req, res, forcedMethod = '') {
     const { prefectureCodes, serviceTypeIds } = req.body || {};
+    const method = String(forcedMethod || req.body?.method || 'multi').trim();
+
+    if (!JOB_METHODS.has(method)) {
+        res.status(400).json({ error: 'method は multi / opendata / web のいずれかを指定してください。' });
+        return null;
+    }
     if (!Array.isArray(prefectureCodes) || prefectureCodes.length === 0) {
         res.status(400).json({ error: '都道府県を選択してください。' });
         return null;
@@ -60,32 +344,30 @@ function validateScrapeRequest(req, res) {
         res.status(400).json({ error: 'サービス種別を選択してください。' });
         return null;
     }
-    return { prefectureCodes, serviceTypeIds };
+
+    return { method, prefectureCodes, serviceTypeIds };
 }
 
-function tryStartScrapeJob(kind) {
-    if (activeScrapeJob?.running) return null;
-    const job = {
-        id: `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
-        kind,
-        running: true,
-        startedAt: Date.now(),
-    };
-    activeScrapeJob = job;
-    return job;
-}
-
-function finishScrapeJob(job) {
-    if (!job) return;
-    if (activeScrapeJob && activeScrapeJob.id === job.id) {
-        activeScrapeJob = null;
+function resolveRecordsByRequest(req, res) {
+    const requestedJobId = String(req.query.jobId || '').trim();
+    if (!requestedJobId) {
+        return { records: currentData, jobId: currentDataJobId || '' };
     }
-}
 
-function busyErrorResponse(res) {
-    return res.status(409).json({
-        error: '現在別のスクレイピング処理が実行中です。完了後に再実行してください。',
-    });
+    const job = jobs.get(requestedJobId);
+    if (!job) {
+        res.status(404).json({ error: `job not found: ${requestedJobId}` });
+        return null;
+    }
+    if (job.status !== 'completed') {
+        res.status(409).json({
+            error: `job is not completed yet: ${requestedJobId}`,
+            status: job.status,
+        });
+        return null;
+    }
+
+    return { records: job.records || [], jobId: requestedJobId };
 }
 
 app.get('/api/prefectures', (_req, res) => {
@@ -97,16 +379,35 @@ app.get('/api/service-types', (_req, res) => {
 });
 
 app.get('/api/health', (_req, res) => {
+    const running = activeScrapeJob
+        ? {
+              running: true,
+              jobId: activeScrapeJob.id,
+              kind: activeScrapeJob.kind,
+              startedAt: nowIso(activeScrapeJob.startedAt),
+          }
+        : { running: false };
+
+    const counts = {
+        queued: 0,
+        running: 0,
+        completed: 0,
+        failed: 0,
+    };
+    for (const job of jobs.values()) {
+        if (job.status in counts) counts[job.status] += 1;
+    }
+
     res.json({
         ok: true,
-        timestamp: new Date().toISOString(),
-        scraping: activeScrapeJob
-            ? {
-                  running: true,
-                  kind: activeScrapeJob.kind,
-                  startedAt: new Date(activeScrapeJob.startedAt).toISOString(),
-              }
-            : { running: false },
+        timestamp: nowIso(),
+        scraping: running,
+        queue: { length: jobQueue.length },
+        jobs: {
+            total: jobs.size,
+            ...counts,
+        },
+        currentDataJobId: currentDataJobId || null,
     });
 });
 
@@ -122,183 +423,86 @@ app.get('/api/progress', (req, res) => {
     });
 });
 
-app.post('/api/scrape/multi', async (req, res) => {
+app.post('/api/jobs', (req, res) => {
     const payload = validateScrapeRequest(req, res);
     if (!payload) return;
-
-    const job = tryStartScrapeJob('multi');
-    if (!job) return busyErrorResponse(res);
-
-    const { prefectureCodes, serviceTypeIds } = payload;
-
-    try {
-        broadcastProgress({
-            phase: 'start',
-            message: '複数ソース取得を開始します...',
-            progress: 0,
-        });
-
-        const { records, sourceStats } = await scrapeFromMultipleSources(
-            prefectureCodes,
-            serviceTypeIds,
-            broadcastProgress
-        );
-
-        currentData = records.map(normalizeRecordShape);
-
-        broadcastProgress({
-            phase: 'complete',
-            message: `取得完了: ${currentData.length.toLocaleString()}件`,
-            progress: 100,
-        });
-
-        res.json({
-            success: true,
-            count: currentData.length,
-            data: currentData.slice(0, 100),
-            total: currentData.length,
-            sourceStats,
-        });
-    } catch (error) {
-        broadcastProgress({
-            phase: 'error',
-            message: `エラー: ${error.message}`,
-            progress: 0,
-        });
-        res.status(500).json({ error: error.message });
-    } finally {
-        finishScrapeJob(job);
-    }
+    acceptScrapeJob(res, payload);
 });
 
-app.post('/api/scrape/opendata', async (req, res) => {
-    const payload = validateScrapeRequest(req, res);
+app.post('/api/scrape/multi', (req, res) => {
+    const payload = validateScrapeRequest(req, res, 'multi');
     if (!payload) return;
-
-    const job = tryStartScrapeJob('opendata');
-    if (!job) return busyErrorResponse(res);
-
-    const { prefectureCodes, serviceTypeIds } = payload;
-
-    try {
-        broadcastProgress({
-            phase: 'start',
-            message: '公式オープンデータ取得を開始します...',
-            progress: 0,
-        });
-
-        const records = await fetchOpenData(
-            prefectureCodes,
-            serviceTypeIds,
-            broadcastProgress
-        );
-        if (!records.length) {
-            throw new Error(
-                '公式オープンデータから取得できませんでした。条件を変更して再実行してください。'
-            );
-        }
-
-        currentData = records.map(normalizeRecordShape);
-
-        broadcastProgress({
-            phase: 'complete',
-            message: `取得完了: ${currentData.length.toLocaleString()}件`,
-            progress: 100,
-        });
-
-        res.json({
-            success: true,
-            count: currentData.length,
-            data: currentData.slice(0, 100),
-            total: currentData.length,
-            sourceStats: [
-                {
-                    source: 'official-opendata',
-                    count: currentData.length,
-                    status: 'ok',
-                },
-            ],
-        });
-    } catch (error) {
-        broadcastProgress({
-            phase: 'error',
-            message: `エラー: ${error.message}`,
-            progress: 0,
-        });
-        res.status(500).json({ error: error.message });
-    } finally {
-        finishScrapeJob(job);
-    }
+    acceptScrapeJob(res, payload);
 });
 
-app.post('/api/scrape/web', async (req, res) => {
-    const payload = validateScrapeRequest(req, res);
+app.post('/api/scrape/opendata', (req, res) => {
+    const payload = validateScrapeRequest(req, res, 'opendata');
     if (!payload) return;
+    acceptScrapeJob(res, payload);
+});
 
-    const job = tryStartScrapeJob('web');
-    if (!job) return busyErrorResponse(res);
+app.post('/api/scrape/web', (req, res) => {
+    const payload = validateScrapeRequest(req, res, 'web');
+    if (!payload) return;
+    acceptScrapeJob(res, payload);
+});
 
-    const { prefectureCodes, serviceTypeIds } = payload;
-
-    try {
-        broadcastProgress({
-            phase: 'start',
-            message: 'Webスクレイピングを開始します...',
-            progress: 0,
-        });
-
-        const records = await scrapeWebData(
-            prefectureCodes,
-            serviceTypeIds,
-            broadcastProgress
-        );
-        if (!records.length) {
-            throw new Error(
-                'Webスクレイピングで取得できませんでした。条件を変更して再実行してください。'
-            );
-        }
-
-        currentData = records.map(normalizeRecordShape);
-
-        broadcastProgress({
-            phase: 'complete',
-            message: `取得完了: ${currentData.length.toLocaleString()}件`,
-            progress: 100,
-        });
-
-        res.json({
-            success: true,
-            count: currentData.length,
-            data: currentData.slice(0, 100),
-            total: currentData.length,
-            sourceStats: [
-                {
-                    source: 'web-scraping',
-                    count: currentData.length,
-                    status: 'ok',
-                },
-            ],
-        });
-    } catch (error) {
-        broadcastProgress({
-            phase: 'error',
-            message: `エラー: ${error.message}`,
-            progress: 0,
-        });
-        res.status(500).json({ error: error.message });
-    } finally {
-        finishScrapeJob(job);
+app.get('/api/jobs/:jobId', (req, res) => {
+    const jobId = String(req.params.jobId || '').trim();
+    const job = jobs.get(jobId);
+    if (!job) {
+        return res.status(404).json({ error: `job not found: ${jobId}` });
     }
+
+    const afterSeq = Math.max(0, Number.parseInt(String(req.query.after || '0'), 10) || 0);
+    res.json(buildJobStatus(job, afterSeq));
+});
+
+app.get('/api/jobs/:jobId/result', (req, res) => {
+    const jobId = String(req.params.jobId || '').trim();
+    const job = jobs.get(jobId);
+    if (!job) {
+        return res.status(404).json({ error: `job not found: ${jobId}` });
+    }
+
+    if (job.status === 'failed') {
+        return res.status(409).json({
+            jobId: job.id,
+            status: job.status,
+            error: job.error || 'job failed',
+        });
+    }
+
+    if (job.status !== 'completed') {
+        return res.status(202).json({
+            jobId: job.id,
+            status: job.status,
+            progress: job.progress,
+        });
+    }
+
+    return res.json({
+        success: true,
+        jobId: job.id,
+        status: job.status,
+        total: job.total,
+        sourceStats: job.sourceStats,
+        data: (job.records || []).slice(0, 100),
+    });
 });
 
 app.get('/api/data', (req, res) => {
+    const resolved = resolveRecordsByRequest(req, res);
+    if (!resolved) return;
+
+    const { records, jobId } = resolved;
     const page = Number.parseInt(req.query.page, 10) || 1;
     const limit = Number.parseInt(req.query.limit, 10) || 50;
     const search = String(req.query.search || '').trim().toLowerCase();
 
-    let filtered = currentData;
+    let filtered = records;
     if (search) {
-        filtered = currentData.filter((item) => {
+        filtered = records.filter((item) => {
             return (
                 String(item.name || '').toLowerCase().includes(search) ||
                 String(item.address || '').toLowerCase().includes(search) ||
@@ -313,6 +517,7 @@ app.get('/api/data', (req, res) => {
     const data = filtered.slice(start, start + limit);
 
     res.json({
+        jobId: jobId || null,
         data,
         total: filtered.length,
         page,
@@ -321,21 +526,31 @@ app.get('/api/data', (req, res) => {
     });
 });
 
-app.get('/api/export/csv', (_req, res) => {
-    if (!currentData.length) {
+app.get('/api/export/csv', (req, res) => {
+    const resolved = resolveRecordsByRequest(req, res);
+    if (!resolved) return;
+
+    const { records } = resolved;
+    if (!records.length) {
         return res.status(404).json({ error: 'エクスポートするデータがありません。' });
     }
-    const csv = toCSV(currentData);
+
+    const csv = toCSV(records);
     res.setHeader('Content-Type', 'text/csv; charset=utf-8');
     res.setHeader('Content-Disposition', 'attachment; filename="kaigo_data.csv"');
     res.send(csv);
 });
 
-app.get('/api/export/excel', (_req, res) => {
-    if (!currentData.length) {
+app.get('/api/export/excel', (req, res) => {
+    const resolved = resolveRecordsByRequest(req, res);
+    if (!resolved) return;
+
+    const { records } = resolved;
+    if (!records.length) {
         return res.status(404).json({ error: 'エクスポートするデータがありません。' });
     }
-    const buffer = toExcel(currentData);
+
+    const buffer = toExcel(records);
     res.setHeader(
         'Content-Type',
         'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
@@ -344,13 +559,31 @@ app.get('/api/export/excel', (_req, res) => {
     res.send(Buffer.from(buffer));
 });
 
-app.delete('/api/data', (_req, res) => {
+app.delete('/api/data', (req, res) => {
+    const requestedJobId = String(req.query.jobId || '').trim();
+    if (requestedJobId) {
+        const job = jobs.get(requestedJobId);
+        if (!job) {
+            return res.status(404).json({ error: `job not found: ${requestedJobId}` });
+        }
+        job.records = [];
+        job.total = 0;
+        job.sourceStats = [];
+        if (currentDataJobId === requestedJobId) {
+            currentData = [];
+            currentDataJobId = '';
+        }
+        return res.json({ success: true, jobId: requestedJobId });
+    }
+
     currentData = [];
+    currentDataJobId = '';
     res.json({ success: true });
 });
 
 app.listen(PORT, HOST, () => {
     console.log('\nServer started');
     console.log(`  http://${HOST}:${PORT}`);
-    console.log(`  API: http://${HOST}:${PORT}/api/prefectures\n`);
+    console.log(`  API: http://${HOST}:${PORT}/api/prefectures`);
+    console.log(`  Jobs: http://${HOST}:${PORT}/api/jobs\n`);
 });
