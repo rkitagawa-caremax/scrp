@@ -52,41 +52,56 @@ const styles = {
 };
 
 const serviceIcons = {
-    houmon_kaigo: '🏠',
+    houmon_kaigo: '🚶',
     houmon_nyuyoku: '🛁',
-    houmon_kango: '💉',
-    houmon_rehab: '🏃',
+    houmon_kango: '🩺',
+    houmon_rehab: '🧘',
     tsusho_kaigo: '🏢',
-    tsusho_rehab: '🏥',
+    tsusho_rehab: '🏃',
     tanki_seikatsu: '🛏️',
-    tanki_ryoyo: '🩺',
-    tokutei_shisetsu: '🏘️',
-    fukushi_yogu: '♿',
-    kaigo_rojin_fukushi: '🏛️',
-    kaigo_rojin_hoken: '🏗️',
-    kaigo_iryoin: '⚕️',
-    ninchi_group: '🏡',
+    tanki_ryoyo: '🏥',
+    tokutei_shisetsu: '🏠',
+    fukushi_yogu: '🦽',
+    kaigo_rojin_fukushi: '👴',
+    kaigo_rojin_hoken: '🧓',
+    kaigo_iryoin: '💊',
+    ninchi_group: '👥',
     kyotaku_shien: '📋',
-    chiiki_houkatsu: '🤝',
+    chiiki_houkatsu: '🗺️',
 };
 
 export default function ServiceTypeSelector({
     serviceTypes,
     selectedServices,
     onSelectionChange,
+    maxSelectable = Infinity,
+    onLimitReached,
 }) {
     const toggleService = (id) => {
-        const newSelected = selectedServices.includes(id)
+        const isSelected = selectedServices.includes(id);
+        if (!isSelected && selectedServices.length >= maxSelectable) {
+            if (typeof onLimitReached === 'function') {
+                onLimitReached(maxSelectable);
+            }
+            return;
+        }
+
+        const newSelected = isSelected
             ? selectedServices.filter((s) => s !== id)
             : [...selectedServices, id];
         onSelectionChange(newSelected);
     };
 
     const selectAll = () => {
-        if (selectedServices.length === serviceTypes.length) {
+        if (selectedServices.length > 0) {
             onSelectionChange([]);
         } else {
-            onSelectionChange(serviceTypes.map((s) => s.id));
+            const allIds = serviceTypes.map((s) => s.id);
+            const limitedIds = allIds.slice(0, Math.max(1, Number(maxSelectable) || 1));
+            onSelectionChange(limitedIds);
+            if (allIds.length > limitedIds.length && typeof onLimitReached === 'function') {
+                onLimitReached(maxSelectable);
+            }
         }
     };
 
@@ -105,9 +120,7 @@ export default function ServiceTypeSelector({
                         e.target.style.color = 'var(--text-secondary)';
                     }}
                 >
-                    {selectedServices.length === serviceTypes.length
-                        ? '✓ 全選択中'
-                        : '全選択'}
+                    {selectedServices.length > 0 ? '選択解除' : '上位4件を選択'}
                 </button>
                 <button
                     style={styles.controlBtn}
@@ -124,25 +137,32 @@ export default function ServiceTypeSelector({
                     クリア
                 </button>
                 <span style={styles.count}>
-                    {selectedServices.length} / {serviceTypes.length} 選択中
+                    {selectedServices.length} / {Math.min(serviceTypes.length, maxSelectable)} 選択中
                 </span>
             </div>
 
             <div style={styles.container}>
                 {serviceTypes.map((service) => {
                     const isSelected = selectedServices.includes(service.id);
+                    const isDisabled = !isSelected && selectedServices.length >= maxSelectable;
                     return (
                         <div
                             key={service.id}
                             style={{
                                 ...styles.item,
                                 ...(isSelected ? styles.itemSelected : {}),
+                                ...(isDisabled
+                                    ? { opacity: 0.45, cursor: 'not-allowed' }
+                                    : {}),
                             }}
-                            onClick={() => toggleService(service.id)}
+                            onClick={() => {
+                                if (!isDisabled) toggleService(service.id);
+                            }}
                         >
                             <input
                                 type="checkbox"
                                 checked={isSelected}
+                                disabled={isDisabled}
                                 onChange={() => { }}
                                 style={styles.checkbox}
                             />
@@ -155,3 +175,5 @@ export default function ServiceTypeSelector({
         </div>
     );
 }
+
+

@@ -6,9 +6,15 @@ const PAGE_SIZE = 50;
 const RAW_API_BASE = String(import.meta.env.VITE_API_BASE_URL || '').trim();
 const DEFAULT_REMOTE_API_BASE = 'https://scrp-5na6.onrender.com';
 const JOB_POLL_INTERVAL_MS = 2000;
-const JOB_POLL_TIMEOUT_MS = 30 * 60 * 1000;
+const JOB_POLL_TIMEOUT_MS = 45 * 60 * 1000;
+const JOB_NOT_FOUND_RETRY_LIMIT = 20;
+const MAX_SERVICE_SELECTION = 4;
+const SERVICE_BATCH_SIZE = 1;
 const LEGACY_RECOVERY_POLL_INTERVAL_MS = 3000;
 const LEGACY_RECOVERY_TIMEOUT_MS = 12 * 60 * 1000;
+const REQUEST_TIMEOUT_MS = 45 * 1000;
+const REQUEST_RETRY_LIMIT = 3;
+const JOB_STATUS_MAX_LOGS = 80;
 const EXCEL_EXPORT_COLUMNS = [
     { key: 'prefecture', header: 'prefecture', width: 10 },
     { key: 'businessNumber', header: 'businessNumber', width: 14 },
@@ -83,18 +89,17 @@ function normalizeNetworkErrorMessage(error) {
     if (/failed to fetch|networkerror|network request failed/i.test(text)) {
         if (isLocalApiTarget()) {
             return (
-                'APIに接続できません。`npm run server` が起動しているか確認してください。' +
+                'APIに接続できません。"npm run server" を起動しているか確認してください。' +
                 ` 接続先: ${buildApiUrl('/api/health')}`
             );
         }
         return (
-            'APIに接続できません。デプロイ先のAPI URL設定とバックエンド稼働状態を確認してください。' +
+            'APIに接続できません。デプロイ先APIのURL設定とバックエンドの稼働を確認してください。' +
             ` 接続先: ${buildApiUrl('/api/health')}`
         );
     }
     return text || '通信エラーが発生しました。';
 }
-
 function pushDownloadBlob(blob, fileName) {
     const url = URL.createObjectURL(blob);
     const a = document.createElement('a');
@@ -117,6 +122,111 @@ function readFileNameFromDisposition(headerValue, fallbackName) {
 
 function wait(ms) {
     return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function isRetryableHttpStatus(status) {
+    return status === 408 || status === 425 || status === 429 || (status >= 500 && status <= 599);
+}
+
+function isTimeoutError(error) {
+    const text = String(error?.message || '');
+    return (
+        error?.code === 'ETIMEDOUT' ||
+        /timeout|timed out|abort|aborted|AbortError/i.test(text)
+    );
+}
+
+function computeRetryDelayMs(attempt, baseDelayMs = 900) {
+    const exponential = baseDelayMs * 2 ** Math.max(0, attempt - 1);
+    const jitter = Math.floor(Math.random() * 250);
+    return Math.min(8000, exponential + jitter);
+}
+
+async function fetchWithTimeout(url, options = {}, timeoutMs = REQUEST_TIMEOUT_MS) {
+    const controller = new AbortController();
+    const upstreamSignal = options?.signal;
+    let timedOut = false;
+    let timer = null;
+
+    const onAbortFromUpstream = () => controller.abort();
+    if (upstreamSignal) {
+        if (upstreamSignal.aborted) {
+            controller.abort();
+        } else {
+            upstreamSignal.addEventListener('abort', onAbortFromUpstream, { once: true });
+        }
+    }
+
+    if (timeoutMs > 0) {
+        timer = setTimeout(() => {
+            timedOut = true;
+            controller.abort();
+        }, timeoutMs);
+    }
+
+    try {
+        return await fetch(url, { ...options, signal: controller.signal });
+    } catch (error) {
+        if (timedOut) {
+            const timeoutError = new Error(`request timeout (${timeoutMs}ms)`);
+            timeoutError.code = 'ETIMEDOUT';
+            throw timeoutError;
+        }
+        throw error;
+    } finally {
+        if (timer) clearTimeout(timer);
+        if (upstreamSignal) {
+            upstreamSignal.removeEventListener('abort', onAbortFromUpstream);
+        }
+    }
+}
+
+async function fetchWithRetry(url, options = {}, config = {}) {
+    const retries = Math.max(0, Number(config?.retries) || REQUEST_RETRY_LIMIT);
+    const timeoutMs = Math.max(1, Number(config?.timeoutMs) || REQUEST_TIMEOUT_MS);
+    const baseDelayMs = Math.max(100, Number(config?.baseDelayMs) || 900);
+    let lastError = null;
+
+    for (let attempt = 0; attempt <= retries; attempt += 1) {
+        try {
+            const response = await fetchWithTimeout(url, options, timeoutMs);
+            if (response.ok || !isRetryableHttpStatus(response.status) || attempt >= retries) {
+                return response;
+            }
+
+            const retryAfterSec = Number.parseInt(
+                String(response.headers.get('Retry-After') || '0'),
+                10
+            );
+            const retryAfterMs =
+                Number.isFinite(retryAfterSec) && retryAfterSec > 0
+                    ? Math.min(12000, retryAfterSec * 1000)
+                    : 0;
+            const delayMs = retryAfterMs || computeRetryDelayMs(attempt + 1, baseDelayMs);
+            await wait(delayMs);
+        } catch (error) {
+            lastError = error;
+            if (
+                attempt >= retries ||
+                (!isLikelyNetworkDisconnect(error) && !isTimeoutError(error))
+            ) {
+                throw error;
+            }
+            await wait(computeRetryDelayMs(attempt + 1, baseDelayMs));
+        }
+    }
+
+    if (lastError) throw lastError;
+    throw new Error('request failed');
+}
+
+function chunkArray(items, chunkSize) {
+    const safeChunkSize = Math.max(1, Number(chunkSize) || 1);
+    const chunks = [];
+    for (let i = 0; i < items.length; i += safeChunkSize) {
+        chunks.push(items.slice(i, i + safeChunkSize));
+    }
+    return chunks;
 }
 
 function isLikelyNetworkDisconnect(error) {
@@ -186,6 +296,32 @@ async function parseJsonResponse(response, endpointForError) {
     return response.json();
 }
 
+async function readErrorMessageFromResponse(response, endpointForError = '') {
+    const status = Number.parseInt(String(response?.status || 0), 10) || 0;
+    const contentType = String(response.headers.get('Content-Type') || '').toLowerCase();
+
+    if (contentType.includes('application/json')) {
+        try {
+            const payload = await response.json();
+            const message = String(payload?.error || payload?.message || '').trim();
+            if (message) return message;
+        } catch {
+            // ignore json parse error and fall through
+        }
+    }
+
+    if (contentType.startsWith('text/')) {
+        try {
+            const text = (await response.text()).slice(0, 160).replace(/\s+/g, ' ').trim();
+            if (text) return `HTTP ${status}: ${text}`;
+        } catch {
+            // ignore text parse error and fall through
+        }
+    }
+
+    return `HTTP ${status}${endpointForError ? ` (${endpointForError})` : ''}`;
+}
+
 export function useScraper() {
     const [prefectures] = useState(PREFECTURES);
     const [regions] = useState(REGIONS);
@@ -225,12 +361,17 @@ export function useScraper() {
 
             const endpoint = `/api/data?${params.toString()}`;
             try {
-                const response = await fetch(buildApiUrl(endpoint));
+                const endpointUrl = buildApiUrl(endpoint);
+                const response = await fetchWithRetry(endpointUrl, {}, {
+                    retries: 3,
+                    timeoutMs: REQUEST_TIMEOUT_MS,
+                });
                 if (!response.ok) {
-                    throw new Error(`データ取得失敗: HTTP ${response.status}`);
+                    const reason = await readErrorMessageFromResponse(response, endpointUrl);
+                    throw new Error(`データ取得に失敗しました: ${reason}`);
                 }
 
-                const payload = await parseJsonResponse(response, buildApiUrl(endpoint));
+                const payload = await parseJsonResponse(response, endpointUrl);
                 setResults(payload.data || []);
                 setTotalResults(payload.total || 0);
                 setCurrentPage(payload.page || page);
@@ -238,7 +379,7 @@ export function useScraper() {
             } catch (error) {
                 const data = {
                     phase: 'error',
-                    message: `データ読込エラー: ${normalizeNetworkErrorMessage(error)}`,
+                    message: `データ読み込みエラー: ${normalizeNetworkErrorMessage(error)}`,
                     progress: progress.progress || 0,
                 };
                 setProgress(data);
@@ -258,7 +399,11 @@ export function useScraper() {
             for (const path of healthCandidates) {
                 const url = buildApiUrl(path);
                 try {
-                    const response = await fetch(url, { signal: controller.signal });
+                    const response = await fetchWithRetry(
+                        url,
+                        { signal: controller.signal },
+                        { retries: 2, timeoutMs: 20000 }
+                    );
                     if (!response.ok) {
                         lastError = `${url}: HTTP ${response.status}`;
                         continue;
@@ -290,11 +435,11 @@ export function useScraper() {
 
             if (isLocalApiTarget()) {
                 throw new Error(
-                    `APIに接続できません。ローカルAPIを起動してください。最終確認: ${lastError}`
+                    `APIに接続できません。ローカルAPIを起動してから再実行してください。接続確認: ${lastError}`
                 );
             }
             throw new Error(
-                `デプロイ先APIに接続できません。APIデプロイまたは VITE_API_BASE_URL を確認してください。最終確認: ${lastError}`
+                `デプロイ先APIに接続できません。APIの稼働状態か VITE_API_BASE_URL を確認してください。接続確認: ${lastError}`
             );
         } finally {
             clearTimeout(timer);
@@ -302,28 +447,111 @@ export function useScraper() {
     }, []);
 
     const pollJobUntilDone = useCallback(
-        async (jobId) => {
+        async (jobId, baselineTotal = -1, options = {}) => {
             let afterLogSeq = 0;
             const startedAt = Date.now();
             let transientFailureCount = 0;
+            let notFoundCount = 0;
+            const loadResult = options?.loadResult !== false;
+            const setActiveJob = options?.setActiveJob !== false;
 
             while (Date.now() - startedAt < JOB_POLL_TIMEOUT_MS) {
-                const endpoint = `/api/jobs/${encodeURIComponent(jobId)}?after=${afterLogSeq}`;
+                const endpoint = `/api/jobs/${encodeURIComponent(jobId)}?after=${afterLogSeq}&maxLogs=${JOB_STATUS_MAX_LOGS}`;
                 const statusUrl = buildApiUrl(endpoint);
                 let payload = null;
                 try {
-                    const response = await fetch(statusUrl);
+                    const response = await fetchWithRetry(statusUrl, {}, {
+                        retries: 2,
+                        timeoutMs: 25000,
+                    });
                     if (!response.ok) {
-                        throw new Error(`ジョブ状態の取得に失敗しました: HTTP ${response.status}`);
+                        const error = new Error(
+                            `Job status fetch failed: HTTP ${response.status}`
+                        );
+                        error.status = response.status;
+                        throw error;
                     }
                     payload = await parseJsonResponse(response, statusUrl);
                     transientFailureCount = 0;
+                    notFoundCount = 0;
                 } catch (pollError) {
+                    const status = Number.parseInt(String(pollError?.status || '0'), 10) || 0;
+                    if (status === 404) {
+                        notFoundCount += 1;
+                        if (notFoundCount === 1 || notFoundCount % 3 === 0) {
+                            appendLog({
+                                phase: 'parse',
+                                message: `Job status not found. Retrying (${notFoundCount}/${JOB_NOT_FOUND_RETRY_LIMIT})`,
+                                progress: 0,
+                            });
+                        }
+
+                        let running = false;
+                        try {
+                            const healthUrl = buildApiUrl('/api/health');
+                            const healthResponse = await fetch(healthUrl);
+                            if (healthResponse.ok) {
+                                const healthPayload = await parseJsonResponse(
+                                    healthResponse,
+                                    healthUrl
+                                ).catch(() => null);
+                                running = Boolean(healthPayload?.scraping?.running);
+                            }
+                        } catch {
+                            // ignore health probe failure
+                        }
+
+                        try {
+                            const countEndpoint = '/api/data?page=1&limit=1';
+                            const countUrl = buildApiUrl(countEndpoint);
+                            const countResponse = await fetch(countUrl);
+                            if (countResponse.ok) {
+                                const countPayload = await parseJsonResponse(
+                                    countResponse,
+                                    countUrl
+                                ).catch(() => null);
+                                const currentTotal =
+                                    Number.parseInt(String(countPayload?.total || '0'), 10) || 0;
+                                if (
+                                    currentTotal > 0 &&
+                                    (baselineTotal < 0 || currentTotal !== baselineTotal)
+                                ) {
+                                    setSearchQuery('');
+                                    await fetchData(1, '', '');
+                                    return {
+                                        status: 'completed',
+                                        total: currentTotal,
+                                        sourceStats: [],
+                                    };
+                                }
+                            }
+                        } catch {
+                            // ignore data probe failure
+                        }
+
+                        if (notFoundCount >= JOB_NOT_FOUND_RETRY_LIMIT) {
+                            if (!running) {
+                                throw new Error(
+                                    'Job status is missing. It may have been lost after a server restart. Please run again.'
+                                );
+                            }
+                            throw new Error(
+                                'Job status check is unstable. Please wait and try again.'
+                            );
+                        }
+
+                        await wait(JOB_POLL_INTERVAL_MS);
+                        continue;
+                    }
+                    if (status >= 400 && status < 500 && status !== 429) {
+                        throw pollError;
+                    }
+
                     transientFailureCount += 1;
                     if (transientFailureCount % 3 === 1) {
                         appendLog({
                             phase: 'parse',
-                            message: `ジョブ状態確認を再試行します: ${normalizeNetworkErrorMessage(
+                            message: `Retrying job status check: ${normalizeNetworkErrorMessage(
                                 pollError
                             )}`,
                             progress: 0,
@@ -373,9 +601,13 @@ export function useScraper() {
                 }
 
                 if (payload.status === 'completed') {
-                    activeJobIdRef.current = jobId;
-                    setSearchQuery('');
-                    await fetchData(1, '', jobId);
+                    if (setActiveJob) {
+                        activeJobIdRef.current = jobId;
+                    }
+                    if (loadResult) {
+                        setSearchQuery('');
+                        await fetchData(1, '', jobId);
+                    }
                     return payload;
                 }
 
@@ -386,7 +618,7 @@ export function useScraper() {
                 await wait(JOB_POLL_INTERVAL_MS);
             }
 
-            throw new Error('ジョブ監視がタイムアウトしました。時間をおいて再実行してください。');
+            throw new Error('ジョブ追跡がタイムアウトしました。時間を置いて再実行してください。');
         },
         [appendLog, fetchData]
     );
@@ -394,7 +626,7 @@ export function useScraper() {
     const readServerTotal = useCallback(async () => {
         const endpoint = '/api/data?page=1&limit=1';
         const url = buildApiUrl(endpoint);
-        const response = await fetch(url);
+        const response = await fetchWithRetry(url, {}, { retries: 2, timeoutMs: 20000 });
         if (!response.ok) return -1;
         const payload = await parseJsonResponse(response, url).catch(() => null);
         return Number.parseInt(String(payload?.total || '0'), 10) || 0;
@@ -409,7 +641,7 @@ export function useScraper() {
 
             appendLog({
                 phase: 'parse',
-                message: '旧API実行中に接続が切断されました。結果復旧を試みます...',
+                message: '旧API通信で切断が発生したため、接続復旧を待って結果を確認しています...',
                 progress: 0,
             });
 
@@ -433,7 +665,7 @@ export function useScraper() {
                         idlePolls = 0;
                         setProgress({
                             phase: 'scrape',
-                            message: '旧API処理継続中... 復旧を待機しています',
+                            message: '旧APIが処理中です。復旧を待機しています...',
                             progress: 0,
                         });
                         await wait(LEGACY_RECOVERY_POLL_INTERVAL_MS);
@@ -446,7 +678,7 @@ export function useScraper() {
                         await fetchData(1, '', '');
                         const complete = {
                             phase: 'complete',
-                            message: `取得完了: ${total.toLocaleString()}件`,
+                            message: `データ取得完了: ${total.toLocaleString()}件`,
                             progress: 100,
                         };
                         setProgress(complete);
@@ -467,12 +699,142 @@ export function useScraper() {
 
             appendLog({
                 phase: 'error',
-                message: `旧API復旧に失敗しました: ${lastError || '結果を確認できませんでした'}`,
+                message: `旧API復旧待機に失敗しました: ${lastError || '接続確認ができませんでした'}`,
                 progress: 0,
             });
             return false;
         },
         [appendLog, fetchData, readServerTotal]
+    );
+
+    const runLegacyScrapeWithRecovery = useCallback(
+        async (
+            legacyEndpoint,
+            prefCodes,
+            serviceIds,
+            switchMessage,
+            requestOptions = {},
+            jobPollOptions = {}
+        ) => {
+            appendLog({
+                phase: 'parse',
+                message: switchMessage || 'Falling back to legacy API mode...',
+                progress: 0,
+            });
+
+            const baselineTotal = await readServerTotal().catch(() => -1);
+            let legacyResponse;
+            try {
+                legacyResponse = await fetch(buildApiUrl(legacyEndpoint), {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        prefectureCodes: prefCodes,
+                        serviceTypeIds: serviceIds,
+                        appendToCurrentData: Boolean(requestOptions?.appendToCurrentData),
+                        resetCurrentData: Boolean(requestOptions?.resetCurrentData),
+                    }),
+                });
+            } catch (legacyRequestError) {
+                if (isLikelyNetworkDisconnect(legacyRequestError)) {
+                    const recovered = await recoverLegacyScrapeAfterDisconnect(baselineTotal);
+                    if (recovered) return true;
+                }
+                throw legacyRequestError;
+            }
+
+            let legacyPayload = {};
+            try {
+                legacyPayload = await parseJsonResponse(
+                    legacyResponse,
+                    buildApiUrl(legacyEndpoint)
+                );
+            } catch {
+                legacyPayload = {};
+            }
+
+            if (!legacyResponse.ok) {
+                if (
+                    legacyResponse.status >= 500 ||
+                    legacyResponse.status === 408 ||
+                    legacyResponse.status === 429
+                ) {
+                    const recovered = await recoverLegacyScrapeAfterDisconnect(baselineTotal);
+                    if (recovered) return true;
+                }
+                throw new Error(legacyPayload.error || `HTTP ${legacyResponse.status}`);
+            }
+
+            const legacyJobId = String(legacyPayload?.jobId || '').trim();
+            if (legacyResponse.status === 202 && legacyJobId) {
+                appendLog({
+                    phase: 'parse',
+                    message: 'Legacy endpoint returned async job. Continue polling...',
+                    progress: 0,
+                });
+
+                const legacyJobResult = await pollJobUntilDone(
+                    legacyJobId,
+                    baselineTotal,
+                    jobPollOptions
+                );
+                if (Array.isArray(legacyJobResult?.sourceStats)) {
+                    legacyJobResult.sourceStats.forEach((stat) => {
+                        appendLog({
+                            phase: stat.status === 'ok' ? 'parse' : 'error',
+                            message: `${stat.source}: ${stat.count} items`,
+                            progress: -1,
+                        });
+                    });
+                }
+
+                const total = Number.parseInt(String(legacyJobResult?.total || '0'), 10) || 0;
+                const complete = {
+                    phase: 'complete',
+                    message: `Completed: ${total.toLocaleString()} items`,
+                    progress: 100,
+                };
+                setProgress(complete);
+                appendLog(complete);
+                return true;
+            }
+
+            if (Array.isArray(legacyPayload.sourceStats)) {
+                legacyPayload.sourceStats.forEach((stat) => {
+                    appendLog({
+                        phase: stat.status === 'ok' ? 'parse' : 'error',
+                        message: `${stat.source}: ${stat.count} items`,
+                        progress: -1,
+                    });
+                });
+            }
+
+            setSearchQuery('');
+            await fetchData(1, '', '');
+
+            let legacyTotal =
+                Number.parseInt(String(legacyPayload?.total || legacyPayload?.count || '0'), 10) ||
+                0;
+            if (legacyTotal <= 0) {
+                legacyTotal = await readServerTotal().catch(() => 0);
+            }
+
+            const legacyComplete = {
+                phase: 'complete',
+                message: `Completed: ${legacyTotal.toLocaleString()} items`,
+                progress: 100,
+            };
+            setProgress(legacyComplete);
+            appendLog(legacyComplete);
+            return true;
+        },
+        [
+            appendLog,
+            fetchData,
+            pollJobUntilDone,
+            readServerTotal,
+            recoverLegacyScrapeAfterDisconnect,
+        ]
     );
 
     const startScraping = useCallback(
@@ -485,7 +847,7 @@ export function useScraper() {
             setTotalResults(0);
             activeJobIdRef.current = '';
             setProgress({
-                message: '取得ジョブを開始しています...',
+                message: 'Starting scrape job...',
                 progress: 0,
                 phase: 'start',
             });
@@ -497,27 +859,30 @@ export function useScraper() {
             };
             const legacyEndpoint = endpointByMethod[method] || endpointByMethod.multi;
 
-            try {
-                try {
-                    await ensureApiReachable();
-                } catch (healthError) {
-                    if (isLocalApiTarget()) throw healthError;
-                    appendLog({
-                        phase: 'parse',
-                        message: `health-check warning: ${normalizeNetworkErrorMessage(healthError)}`,
-                        progress: 0,
-                    });
-                }
-
+            const submitAndTrackJob = async (
+                targetServiceIds,
+                {
+                    appendToCurrentData = false,
+                    resetCurrentData = false,
+                    suppressCompleteLog = false,
+                    pollOptions = {},
+                } = {}
+            ) => {
                 const endpoint = '/api/jobs';
-                const response = await fetch(buildApiUrl(endpoint), {
+                const baselineTotalForJob = await readServerTotal().catch(() => -1);
+                const response = await fetchWithRetry(buildApiUrl(endpoint), {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify({
                         method,
                         prefectureCodes: prefCodes,
-                        serviceTypeIds: serviceIds,
+                        serviceTypeIds: targetServiceIds,
+                        appendToCurrentData,
+                        resetCurrentData,
                     }),
+                }, {
+                    retries: 2,
+                    timeoutMs: REQUEST_TIMEOUT_MS,
                 });
 
                 let payload = {};
@@ -529,126 +894,186 @@ export function useScraper() {
 
                 if (!response.ok) {
                     if (response.status === 404) {
-                        appendLog({
-                            phase: 'parse',
-                            message: '新API未対応のため旧APIモードで実行します...',
-                            progress: 0,
-                        });
-
-                        const baselineTotal = await readServerTotal().catch(() => -1);
-                        let legacyResponse;
-                        try {
-                            legacyResponse = await fetch(buildApiUrl(legacyEndpoint), {
-                                method: 'POST',
-                                headers: { 'Content-Type': 'application/json' },
-                                body: JSON.stringify({
-                                    prefectureCodes: prefCodes,
-                                    serviceTypeIds: serviceIds,
-                                }),
-                            });
-                        } catch (legacyRequestError) {
-                            if (isLikelyNetworkDisconnect(legacyRequestError)) {
-                                const recovered =
-                                    await recoverLegacyScrapeAfterDisconnect(baselineTotal);
-                                if (recovered) return;
-                            }
-                            throw legacyRequestError;
-                        }
-
-                        let legacyPayload = {};
-                        try {
-                            legacyPayload = await parseJsonResponse(
-                                legacyResponse,
-                                buildApiUrl(legacyEndpoint)
-                            );
-                        } catch {
-                            legacyPayload = {};
-                        }
-
-                        if (!legacyResponse.ok) {
-                            if (
-                                legacyResponse.status >= 500 ||
-                                legacyResponse.status === 408 ||
-                                legacyResponse.status === 429
-                            ) {
-                                const recovered =
-                                    await recoverLegacyScrapeAfterDisconnect(baselineTotal);
-                                if (recovered) return;
-                            }
-                            throw new Error(legacyPayload.error || `HTTP ${legacyResponse.status}`);
-                        }
-
-                        if (Array.isArray(legacyPayload.sourceStats)) {
-                            legacyPayload.sourceStats.forEach((stat) => {
-                                appendLog({
-                                    phase: stat.status === 'ok' ? 'parse' : 'error',
-                                    message: `${stat.source}: ${stat.count}件`,
-                                    progress: -1,
-                                });
-                            });
-                        }
-
-                        setSearchQuery('');
-                        await fetchData(1, '', '');
-
-                        let legacyTotal =
-                            Number.parseInt(
-                                String(legacyPayload?.total || legacyPayload?.count || '0'),
-                                10
-                            ) || 0;
-                        if (legacyTotal <= 0) {
-                            legacyTotal = await readServerTotal().catch(() => 0);
-                        }
-                        const legacyComplete = {
-                            phase: 'complete',
-                            message: `取得完了: ${legacyTotal.toLocaleString()}件`,
-                            progress: 100,
+                        await runLegacyScrapeWithRecovery(
+                            legacyEndpoint,
+                            prefCodes,
+                            targetServiceIds,
+                            'New API endpoint is unavailable. Switching to legacy mode...',
+                        );
+                        const total = await readServerTotal().catch(() => 0);
+                        return {
+                            status: 'completed',
+                            total,
+                            accumulatedTotal: total,
+                            sourceStats: [],
                         };
-                        setProgress(legacyComplete);
-                        appendLog(legacyComplete);
-                        return;
                     }
                     throw new Error(payload.error || `HTTP ${response.status}`);
                 }
 
                 const jobId = String(payload?.jobId || '').trim();
-                if (!jobId) throw new Error('ジョブIDが返却されませんでした。');
+                if (!jobId) {
+                    throw new Error('Job ID was not returned by API.');
+                }
 
                 const queued = {
                     phase: 'start',
                     message:
                         Number.parseInt(String(payload?.queuePosition || '0'), 10) > 1
-                            ? `ジョブを受け付けました（待機 ${payload.queuePosition} 番目）`
-                            : 'ジョブを受け付けました。進捗を監視しています...',
+                            ? `Job accepted (queue: ${payload.queuePosition})`
+                            : 'Job accepted. Tracking progress...',
                     progress: 0,
                 };
                 setProgress(queued);
                 appendLog(queued);
 
-                const jobResult = await pollJobUntilDone(jobId);
-                if (Array.isArray(jobResult.sourceStats)) {
+                let jobResult;
+                try {
+                    jobResult = await pollJobUntilDone(jobId, baselineTotalForJob, pollOptions);
+                } catch (jobTrackingError) {
+                    const trackingMessage = String(jobTrackingError?.message || '');
+                    if (
+                        /HTTP 404|job not found|job status|timeout|network|fetch/i.test(
+                            trackingMessage
+                        )
+                    ) {
+                        await runLegacyScrapeWithRecovery(
+                            legacyEndpoint,
+                            prefCodes,
+                            targetServiceIds,
+                            'Job tracking failed. Retrying with legacy mode...',
+                            {
+                                appendToCurrentData,
+                                resetCurrentData,
+                            },
+                            pollOptions
+                        );
+                        const total = await readServerTotal().catch(() => 0);
+                        jobResult = {
+                            status: 'completed',
+                            total,
+                            accumulatedTotal: total,
+                            sourceStats: [],
+                        };
+                    } else {
+                        throw jobTrackingError;
+                    }
+                }
+
+                if (Array.isArray(jobResult?.sourceStats)) {
                     jobResult.sourceStats.forEach((stat) => {
                         appendLog({
                             phase: stat.status === 'ok' ? 'parse' : 'error',
-                            message: `${stat.source}: ${stat.count}件`,
+                            message: `${stat.source}: ${stat.count} items`,
                             progress: -1,
                         });
                     });
                 }
 
-                const total = Number.parseInt(String(jobResult?.total || '0'), 10) || 0;
+                if (!suppressCompleteLog) {
+                    const total = Number.parseInt(String(jobResult?.total || '0'), 10) || 0;
+                    const complete = {
+                        phase: 'complete',
+                        message: `Completed: ${total.toLocaleString()} items`,
+                        progress: 100,
+                    };
+                    setProgress(complete);
+                    appendLog(complete);
+                }
 
-                const complete = {
-                    phase: 'complete',
-                    message: `取得完了: ${total.toLocaleString()}件`,
-                    progress: 100,
-                };
-                setProgress(complete);
-                appendLog(complete);
+                return jobResult;
+            };
+
+            try {
+                if (serviceIds.length > MAX_SERVICE_SELECTION) {
+                    throw new Error(
+                        `You can run up to ${MAX_SERVICE_SELECTION} service types at once.`
+                    );
+                }
+
+                try {
+                    await ensureApiReachable();
+                } catch (healthError) {
+                    if (isLocalApiTarget()) throw healthError;
+                    appendLog({
+                        phase: 'parse',
+                        message: `health-check warning: ${normalizeNetworkErrorMessage(healthError)}`,
+                        progress: 0,
+                    });
+                }
+
+                const shouldSplitByService = serviceIds.length > 1;
+                if (shouldSplitByService) {
+                    const serviceChunks = chunkArray(serviceIds, SERVICE_BATCH_SIZE);
+                    appendLog({
+                        phase: 'start',
+                        message: `Load-spread mode enabled: ${serviceChunks.length} jobs`,
+                        progress: 0,
+                    });
+
+                    try {
+                        await fetch(buildApiUrl('/api/data'), { method: 'DELETE' });
+                    } catch {
+                        // ignore cleanup failure and continue
+                    }
+
+                    activeJobIdRef.current = '';
+                    let accumulatedTotal = 0;
+
+                    for (let i = 0; i < serviceChunks.length; i += 1) {
+                        const chunk = serviceChunks[i];
+                        appendLog({
+                            phase: 'start',
+                            message: `Processing chunk ${i + 1}/${serviceChunks.length} (${chunk.join(',')})`,
+                            progress: 0,
+                        });
+
+                        const jobResult = await submitAndTrackJob(chunk, {
+                            appendToCurrentData: true,
+                            resetCurrentData: i === 0,
+                            suppressCompleteLog: true,
+                            pollOptions: {
+                                loadResult: false,
+                                setActiveJob: false,
+                            },
+                        });
+
+                        const mergedTotalFromJob =
+                            Number.parseInt(String(jobResult?.accumulatedTotal || '0'), 10) || 0;
+                        if (mergedTotalFromJob > 0) {
+                            accumulatedTotal = mergedTotalFromJob;
+                        } else {
+                            accumulatedTotal = await readServerTotal().catch(() => accumulatedTotal);
+                        }
+
+                        const progressRatio = Math.round(((i + 1) / serviceChunks.length) * 100);
+                        setProgress({
+                            phase: 'parse',
+                            message: `Chunk ${i + 1}/${serviceChunks.length} completed`,
+                            progress: progressRatio,
+                        });
+                    }
+
+                    setSearchQuery('');
+                    await fetchData(1, '', '');
+
+                    const finalTotal =
+                        (await readServerTotal().catch(() => accumulatedTotal)) || accumulatedTotal;
+                    const complete = {
+                        phase: 'complete',
+                        message: `Completed: ${Number(finalTotal).toLocaleString()} items`,
+                        progress: 100,
+                    };
+                    setProgress(complete);
+                    appendLog(complete);
+                    return;
+                }
+
+                await submitAndTrackJob(serviceIds);
             } catch (error) {
                 const failed = {
                     phase: 'error',
-                    message: `エラー: ${normalizeNetworkErrorMessage(error)}`,
+                    message: `Error: ${normalizeNetworkErrorMessage(error)}`,
                     progress: 0,
                 };
                 setProgress(failed);
@@ -663,7 +1088,7 @@ export function useScraper() {
             fetchData,
             pollJobUntilDone,
             readServerTotal,
-            recoverLegacyScrapeAfterDisconnect,
+            runLegacyScrapeWithRecovery,
         ]
     );
 
@@ -685,12 +1110,29 @@ export function useScraper() {
                     let expectedTotal = 0;
 
                     while (page <= 2000) {
-                        const endpoint = encodedJobId
+                        const primaryEndpoint = encodedJobId
                             ? `/api/data?page=${page}&limit=${limit}&jobId=${encodedJobId}`
                             : `/api/data?page=${page}&limit=${limit}`;
-                        const response = await fetch(buildApiUrl(endpoint));
+                        let endpoint = primaryEndpoint;
+                        let response = await fetchWithRetry(buildApiUrl(endpoint), {}, {
+                            retries: 2,
+                            timeoutMs: REQUEST_TIMEOUT_MS,
+                        });
+
+                        if (!response.ok && response.status === 404 && encodedJobId) {
+                            endpoint = `/api/data?page=${page}&limit=${limit}`;
+                            response = await fetchWithRetry(buildApiUrl(endpoint), {}, {
+                                retries: 2,
+                                timeoutMs: REQUEST_TIMEOUT_MS,
+                            });
+                        }
+
                         if (!response.ok) {
-                            throw new Error(`HTTP ${response.status}`);
+                            const reason = await readErrorMessageFromResponse(
+                                response,
+                                buildApiUrl(endpoint)
+                            );
+                            throw new Error(reason);
                         }
 
                         const payload = await parseJsonResponse(
@@ -725,30 +1167,59 @@ export function useScraper() {
                         )}`,
                         progress: -1,
                     });
+
+                    if (results.length > 0) {
+                        const blob = buildExcelBlob(results);
+                        pushDownloadBlob(blob, 'kaigo_data.xlsx');
+                        return;
+                    }
                 }
             }
 
-            const exportPath = (() => {
-                const base = format === 'csv' ? '/api/export/csv' : '/api/export/excel';
-                return encodedJobId ? `${base}?jobId=${encodedJobId}` : base;
-            })();
+            const baseExportPath = format === 'csv' ? '/api/export/csv' : '/api/export/excel';
+            const exportPaths = encodedJobId
+                ? [`${baseExportPath}?jobId=${encodedJobId}`, baseExportPath]
+                : [baseExportPath];
             const fallbackName = format === 'csv' ? 'kaigo_data.csv' : 'kaigo_data.xlsx';
+            let lastErrorMessage = '';
 
-            try {
-                const response = await fetch(buildApiUrl(exportPath));
-                if (!response.ok) {
-                    throw new Error(`HTTP ${response.status}`);
+            for (const exportPath of exportPaths) {
+                try {
+                    const response = await fetchWithRetry(buildApiUrl(exportPath), {}, {
+                        retries: 2,
+                        timeoutMs: REQUEST_TIMEOUT_MS,
+                    });
+                    if (!response.ok) {
+                        lastErrorMessage = await readErrorMessageFromResponse(
+                            response,
+                            buildApiUrl(exportPath)
+                        );
+                        continue;
+                    }
+
+                    const blob = await response.blob();
+                    const fileName = readFileNameFromDisposition(
+                        response.headers.get('Content-Disposition'),
+                        fallbackName
+                    );
+                    pushDownloadBlob(blob, fileName);
+                    return;
+                } catch (error) {
+                    lastErrorMessage = normalizeNetworkErrorMessage(error);
                 }
-
-                const blob = await response.blob();
-                const fileName = readFileNameFromDisposition(
-                    response.headers.get('Content-Disposition'),
-                    fallbackName
-                );
-                pushDownloadBlob(blob, fileName);
-            } catch (error) {
-                alert(`エクスポート失敗: ${normalizeNetworkErrorMessage(error)}`);
             }
+
+            if (format === 'excel' && results.length > 0) {
+                const blob = buildExcelBlob(results);
+                pushDownloadBlob(blob, 'kaigo_data.xlsx');
+                return;
+            }
+
+            alert(
+                `エクスポートに失敗しました: ${
+                    lastErrorMessage || '原因を特定できませんでした'
+                }`
+            );
         },
         [appendLog, results, totalResults]
     );

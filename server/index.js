@@ -4,11 +4,14 @@ import { PREFECTURES, REGIONS, SERVICE_TYPES } from './utils/prefectures.js';
 import { fetchOpenData } from './scrapers/opendata.js';
 import { scrapeWebData } from './scrapers/web-scraper.js';
 import { scrapeFromMultipleSources } from './scrapers/multi-source.js';
+import { dedupeRecords } from './scrapers/record-normalizer.js';
 import { toCSV, toExcel } from './utils/export.js';
 
 const app = express();
 const PORT = Number.parseInt(process.env.PORT || '3001', 10);
 const HOST = process.env.HOST || '0.0.0.0';
+
+const MAX_SERVICE_TYPES_PER_REQUEST = 4;
 
 const MAX_STORED_JOBS = 30;
 const MAX_JOB_LOGS = 400;
@@ -130,10 +133,18 @@ function pushJobLog(job, data) {
     });
 }
 
-function buildJobStatus(job, afterSeq = 0) {
+function buildJobStatus(job, afterSeq = 0, maxLogs = MAX_JOB_LOGS) {
     const safeAfter = Number.isFinite(afterSeq) ? Math.max(0, afterSeq) : 0;
-    const logs =
+    const safeMaxLogs = Number.isFinite(maxLogs)
+        ? Math.max(0, Math.min(MAX_JOB_LOGS, maxLogs))
+        : MAX_JOB_LOGS;
+    let logs =
         safeAfter > 0 ? job.logs.filter((entry) => entry.seq > safeAfter) : [...job.logs];
+    if (safeMaxLogs === 0) {
+        logs = [];
+    } else if (logs.length > safeMaxLogs) {
+        logs = logs.slice(-safeMaxLogs);
+    }
 
     return {
         jobId: job.id,
@@ -145,6 +156,7 @@ function buildJobStatus(job, afterSeq = 0) {
         finishedAt: job.finishedAt ? nowIso(job.finishedAt) : null,
         progress: job.progress,
         total: job.total,
+        accumulatedTotal: currentData.length,
         sourceStats: job.sourceStats,
         error: job.error || '',
         lastLogSeq: job.logSeq,
@@ -153,12 +165,20 @@ function buildJobStatus(job, afterSeq = 0) {
     };
 }
 
-function createScrapeJob({ method, prefectureCodes, serviceTypeIds }) {
+function createScrapeJob({
+    method,
+    prefectureCodes,
+    serviceTypeIds,
+    appendToCurrentData = false,
+    resetCurrentData = false,
+}) {
     const job = {
         id: `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
         method,
         prefectureCodes: [...prefectureCodes],
         serviceTypeIds: [...serviceTypeIds],
+        appendToCurrentData: Boolean(appendToCurrentData),
+        resetCurrentData: Boolean(resetCurrentData),
         status: 'queued',
         createdAt: Date.now(),
         startedAt: 0,
@@ -267,7 +287,16 @@ async function executeScrapeJob(job) {
         job.status = 'completed';
         job.finishedAt = Date.now();
 
-        currentData = normalized;
+        if (job.resetCurrentData) {
+            currentData = [];
+            currentDataJobId = '';
+        }
+
+        if (job.appendToCurrentData) {
+            currentData = dedupeRecords([...currentData, ...normalized]);
+        } else {
+            currentData = normalized;
+        }
         currentDataJobId = job.id;
 
         pushJobLog(job, {
@@ -331,6 +360,8 @@ function acceptScrapeJob(res, payload) {
 function validateScrapeRequest(req, res, forcedMethod = '') {
     const { prefectureCodes, serviceTypeIds } = req.body || {};
     const method = String(forcedMethod || req.body?.method || 'multi').trim();
+    const appendToCurrentData = Boolean(req.body?.appendToCurrentData);
+    const resetCurrentData = Boolean(req.body?.resetCurrentData);
 
     if (!JOB_METHODS.has(method)) {
         res.status(400).json({ error: 'method は multi / opendata / web のいずれかを指定してください。' });
@@ -344,8 +375,21 @@ function validateScrapeRequest(req, res, forcedMethod = '') {
         res.status(400).json({ error: 'サービス種別を選択してください。' });
         return null;
     }
+    if (serviceTypeIds.length > MAX_SERVICE_TYPES_PER_REQUEST) {
+        res.status(400).json({
+            error: `serviceTypeIds must be ${MAX_SERVICE_TYPES_PER_REQUEST} or fewer`,
+        });
+        return null;
+    }
 
-    return { method, prefectureCodes, serviceTypeIds };
+
+    return {
+        method,
+        prefectureCodes,
+        serviceTypeIds,
+        appendToCurrentData,
+        resetCurrentData,
+    };
 }
 
 function resolveRecordsByRequest(req, res) {
@@ -455,7 +499,9 @@ app.get('/api/jobs/:jobId', (req, res) => {
     }
 
     const afterSeq = Math.max(0, Number.parseInt(String(req.query.after || '0'), 10) || 0);
-    res.json(buildJobStatus(job, afterSeq));
+    const requestedMaxLogs = Number.parseInt(String(req.query.maxLogs || '80'), 10);
+    const maxLogs = Number.isFinite(requestedMaxLogs) ? requestedMaxLogs : 80;
+    res.json(buildJobStatus(job, afterSeq, maxLogs));
 });
 
 app.get('/api/jobs/:jobId/result', (req, res) => {
@@ -486,6 +532,7 @@ app.get('/api/jobs/:jobId/result', (req, res) => {
         jobId: job.id,
         status: job.status,
         total: job.total,
+        accumulatedTotal: currentData.length,
         sourceStats: job.sourceStats,
         data: (job.records || []).slice(0, 100),
     });
